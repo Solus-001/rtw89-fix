@@ -1,0 +1,547 @@
+#!/usr/bin/env bash
+# rtw89-fix - repair the RTL8852BE (rtw89) WiFi card on Linux.
+#
+# Works on Arch-based, Fedora-based, and Ubuntu/Debian-based distros. The
+# distro family is detected from /etc/os-release and pacman, dnf, or apt is
+# used to fill in missing dependencies. NetworkManager and iw are optional:
+# on iwd / systemd-networkd setups the script degrades gracefully instead of
+# failing.
+#
+# WHY THE OLD APPROACH FAILED
+# ---------------------------
+# The card dies by dropping into PCI D3cold. That is a power state BELOW the
+# driver: the crystal oscillator never comes back, and the firmware is gone
+# for good. Unloading and reloading rtw89 modules cannot recover from it,
+# because the reset the driver does on load happens inside a device that is
+# still in D3cold. Only a reboot (or a PCI bus remove/rescan, which we can do
+# here) brings it back.
+#
+# So this script does two separate things:
+#   1. Prevention - stop D3cold from ever being allowed on the card and on the
+#      root port it hangs off, plus keep the driver out of low power mode.
+#   2. Recovery  - when the card is already wedged, power-cycle the PCI device
+#      so it comes back without a reboot.
+#
+# Usage:
+#   rtw89-fix            apply prevention config (safe to re-run)
+#   rtw89-fix --heal     recover a wedged card right now (needs root)
+#   rtw89-fix --check    report state only, no changes, no root
+#   rtw89-fix --revert   remove every file this script created
+#   rtw89-fix --help     show usage
+#
+# Run it with sudo, or plain and it will re-exec itself under sudo.
+
+set -euo pipefail
+
+MODPROBE_CONF=/etc/modprobe.d/rtw89.conf
+MODPROBE_BAK=/etc/modprobe.d/rtw89.conf.rtw89-fix.bak
+UDEV_RULE=/etc/udev/rules.d/99-rtw89-d3cold.rules
+MARKER='Managed by rtw89-fix'
+
+# Driver modules, in dependency order. modprobe takes ONE module name and
+# treats the rest as parameters, so these must never share a command line.
+LOAD_ORDER=(rtw89_8852b_common rtw89_8852b rtw89_pci rtw89_8852be)
+UNLOAD_ORDER=(rtw89_8852be rtw89_pci rtw89_8852b rtw89_8852b_common rtw89_core)
+
+# PCI vendor/device of the RTL8852BE.
+PCI_ID=10ec:b85b
+
+red() { printf '\033[31m%s\033[0m\n' "$*"; }
+grn() { printf '\033[32m%s\033[0m\n' "$*"; }
+ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
+die() {
+	red "error: $*"
+	exit 1
+}
+
+# --- portability -----------------------------------------------------------
+
+# kmod, udevadm and iw live in sbin directories on Debian/Ubuntu and Fedora,
+# and neither a user shell nor every sudo config puts them on PATH. Normalise
+# once so every later call just works.
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+export PATH
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Distro detection, from the freedesktop-standard /etc/os-release that every
+# systemd distro ships. ID_LIKE catches derivatives: Manjaro says "arch",
+# Mint says "ubuntu debian", Rocky/Alma say "rhel centos fedora".
+OS_ID=unknown
+OS_LIKE=""
+OS_PRETTY="unknown distro"
+if [ -r /etc/os-release ]; then
+	# shellcheck disable=SC1091
+	. /etc/os-release
+	OS_ID="${ID:-unknown}"
+	OS_LIKE="${ID_LIKE:-}"
+	OS_PRETTY="${PRETTY_NAME:-$OS_ID}"
+fi
+
+distro_family() {
+	case " $OS_ID $OS_LIKE " in
+	*" arch "*) echo arch ;;
+	*" fedora "* | *" rhel "* | *" centos "*) echo fedora ;;
+	*" debian "* | *" ubuntu "*) echo debian ;;
+	*) echo unknown ;;
+	esac
+}
+
+# The install command for this family. Words are intentional: callers expand
+# it unquoted so "pacman -S --needed" becomes three arguments.
+pkg_manager() {
+	case "$(distro_family)" in
+	arch) echo "pacman -S --needed" ;;
+	fedora) echo "dnf install" ;;
+	debian) echo "apt-get install" ;;
+	esac
+}
+
+# The package that provides a command, named for this family's repos.
+pkg_for() {
+	local cmd="$1" family
+	family=$(distro_family)
+	case "$cmd" in
+	modprobe | lsmod) echo kmod ;;
+	iw) echo iw ;;
+	rfkill)
+		case "$family" in
+		debian) echo rfkill ;;
+		*) echo util-linux ;;
+		esac
+		;;
+	udevadm)
+		case "$family" in
+		arch) echo systemd ;;
+		fedora) echo systemd-udev ;;
+		debian) echo udev ;;
+		*) echo udev ;;
+		esac
+		;;
+	nmcli)
+		case "$family" in
+		arch) echo networkmanager ;;
+		fedora) echo NetworkManager ;;
+		debian) echo network-manager ;;
+		*) echo NetworkManager ;;
+		esac
+		;;
+	esac
+}
+
+# Required tools are modprobe (kmod) and udevadm. Anything else only limits
+# reporting or the radio-cycle recovery step, so it warns instead of dying.
+ensure_deps() {
+	local missing=() c
+	for c in modprobe udevadm; do
+		have "$c" || missing+=("$c")
+	done
+	if [ "${#missing[@]}" -gt 0 ]; then
+		red "missing required tools: ${missing[*]}"
+		local pm pkgs=() pkg ans=""
+		pm=$(pkg_manager)
+		for c in "${missing[@]}"; do
+			pkg=$(pkg_for "$c")
+			[ -n "$pkg" ] && pkgs+=("$pkg")
+		done
+		if [ -n "$pm" ] && [ "${#pkgs[@]}" -gt 0 ]; then
+			echo "distro: $OS_PRETTY"
+			echo "install with:  $pm ${pkgs[*]}"
+			if [ -t 0 ]; then
+				read -r -p "install now? [y/N] " ans || ans=""
+			fi
+			case "$ans" in
+			y | Y | yes | YES) $pm "${pkgs[@]}" || die "package install failed" ;;
+			*) die "cannot continue without: ${missing[*]}" ;;
+			esac
+		else
+			die "unrecognised distro; install kmod and udev manually, then re-run"
+		fi
+	fi
+	for c in iw nmcli; do
+		have "$c" || ylw "note: $c not found (package: $(pkg_for "$c")); some steps will be skipped"
+	done
+	return 0
+}
+
+need_root() {
+	[ "$(id -u)" -eq 0 ] && return 0
+	if [ -n "${RTW89_FIX_NO_SUDO:-}" ]; then
+		die "not root and RTW89_FIX_NO_SUDO is set"
+	fi
+	ylw "need root, re-running under sudo..."
+	exec sudo env RTW89_FIX_NO_SUDO=1 "$0" "$@"
+}
+
+# --- PCI discovery -------------------------------------------------------
+
+# The card's BDF, e.g. 0000:01:00.0. Found by matching vendor/device rather
+# than hardcoding, so this survives a firmware or slot change.
+card_bdf() {
+	local dev
+	for dev in /sys/bus/pci/devices/*/; do
+		[ -f "${dev}vendor" ] || continue
+		[ "$(cat "${dev}vendor" 2>/dev/null)" = "0x${PCI_ID%%:*}" ] || continue
+		[ "$(cat "${dev}device" 2>/dev/null)" = "0x${PCI_ID##*:}" ] || continue
+		printf '%s\n' "$(basename "$dev")"
+		return 0
+	done
+	return 1
+}
+
+# The PCIe root port the card sits behind. Cutting D3cold here as well is what
+# makes the fix stick on some firmware; D3cold is negotiated port-wide.
+root_port_bdf() {
+	local bdf parent
+	bdf=$(card_bdf) || return 1
+	parent=$(dirname "$(readlink -f "/sys/bus/pci/devices/$bdf")")
+	printf '%s\n' "$(basename "$parent")"
+}
+
+# Is the chip driver in the kernel?
+# /sys/module appears for loaded modules and built-ins alike, and reading it
+# cannot die of SIGPIPE the way `lsmod | grep -q` can: grep -q exits on the
+# first match, lsmod dies of SIGPIPE, and under `set -o pipefail` that makes
+# a loaded driver report as absent.
+card_present() {
+	[ -d /sys/module/rtw89_8852be ]
+}
+
+# The wireless interface, whatever it ended up being named. It is not always
+# wlan0: after a module reload the old name is freed and the kernel picks the
+# next free one, which is how this card becomes wlan1.
+wifi_iface() {
+	for i in /sys/class/net/wlan*; do
+		[ -e "$i" ] || continue
+		basename "$i"
+		return 0
+	done
+	return 1
+}
+
+# Is NetworkManager installed AND running? nmcli exits nonzero when the
+# daemon is absent, which also covers iwd / systemd-networkd systems.
+have_nm() {
+	have nmcli && nmcli general status >/dev/null 2>&1
+}
+
+# Is the interface associated with an AP? iw says "Connected to ..." when it
+# is; without iw, fall back to the interface operstate.
+link_up() {
+	local iface="$1"
+	[ -n "$iface" ] || return 1
+	if have iw; then
+		iw dev "$iface" link 2>/dev/null | grep -q '^Connected to'
+	else
+		[ "$(cat "/sys/class/net/$iface/operstate" 2>/dev/null)" = "up" ]
+	fi
+}
+
+# --- reporting -----------------------------------------------------------
+
+report() {
+	local bdf iface ps d3cold state nmstate
+
+	bdf=$(card_bdf) || bdf="not found"
+	iface=$(wifi_iface) || iface="none"
+
+	ps=$(cat /sys/module/rtw89_core/parameters/disable_ps_mode 2>/dev/null || echo "n/a")
+	d3cold=$(cat "/sys/bus/pci/devices/$bdf/d3cold_allowed" 2>/dev/null || echo "n/a")
+	state="no interface"
+	if [ "$iface" != "none" ]; then
+		if have iw; then
+			state=$(iw dev "$iface" link 2>/dev/null | head -1 || true)
+			[ -z "$state" ] && state="down, no link"
+		else
+			state="unknown (install iw for link details)"
+		fi
+	fi
+	if have_nm; then
+		nmstate=$(nmcli -g GENERAL.STATE dev show "$iface" 2>/dev/null || echo "no device")
+	else
+		nmstate="unavailable (NetworkManager not running)"
+	fi
+
+	echo "  distro:          $OS_PRETTY"
+	echo "  PCI device:      $bdf"
+	echo "  driver:          $(card_present && echo loaded || echo absent)"
+	echo "  interface:       $iface"
+	echo "  link:            $state"
+	echo "  NetworkManager:  $nmstate"
+	echo "  disable_ps_mode: $ps   (want Y)"
+	echo "  d3cold_allowed:  $d3cold   (want 0)"
+	if [ "$d3cold" = "1" ]; then
+		echo "  ^^ this is the bug: D3cold is allowed, the card can go dead"
+	fi
+	echo "  modprobe conf:   $([ -f "$MODPROBE_CONF" ] && echo present || echo absent)"
+	echo "  udev rule:       $([ -f "$UDEV_RULE" ] && echo present || echo absent)"
+}
+
+# --- prevention ----------------------------------------------------------
+
+write_modprobe_conf() {
+	if [ -f "$MODPROBE_CONF" ] && ! grep -q "$MARKER" "$MODPROBE_CONF"; then
+		ylw "backing up your existing $MODPROBE_CONF"
+		cp -a "$MODPROBE_CONF" "$MODPROBE_BAK"
+	fi
+	{
+		echo "# $MARKER. Do not edit by hand; rerun rtw89-fix."
+		echo "# disable_ps_mode stops the firmware entering LPS, which is what"
+		echo "# leaves the xtal stuck. The aspm/clkreq lines stop the PCIe link"
+		echo "# dropping into L1ss across suspend."
+		echo "options rtw89_core disable_ps_mode=1"
+		echo "options rtw89_pci disable_aspm_l1ss=1 disable_clkreq=1"
+		# Load after btusb uploads its firmware. The combo card shares one
+		# RF frontend with Bluetooth; racing init makes coexistence flaky.
+		echo "softdep rtw89_8852be pre: btusb"
+		echo "softdep rtw89_pci pre: btusb"
+	} >"$MODPROBE_CONF"
+	grn "wrote $MODPROBE_CONF"
+}
+
+# d3cold_allowed lives on the PCI device, so a modprobe option cannot reach
+# it. udev is the only hook that runs early enough, at every boot.
+write_udev_rule() {
+	local card port
+	card=$(card_bdf) || die "could not find PCI device $PCI_ID"
+	port=$(root_port_bdf) || port=""
+
+	{
+		echo "# $MARKER. Blocks D3cold, the PCI power state that kills this card."
+		echo "SUBSYSTEM==\"pci\", KERNEL==\"$card\", ATTR{d3cold_allowed}=\"0\""
+		if [ -n "$port" ] && [ "$port" != "$card" ]; then
+			echo "SUBSYSTEM==\"pci\", KERNEL==\"$port\", ATTR{d3cold_allowed}=\"0\""
+		fi
+	} >"$UDEV_RULE"
+
+	grn "wrote $UDEV_RULE"
+	echo "     card:  $card d3cold blocked"
+	[ -n "$port" ] && [ "$port" != "$card" ] &&
+		echo "     port:  $port d3cold blocked"
+	return 0
+}
+
+# Apply the block right now too, so it is off before the next suspend rather
+# than after the next reboot. Card first, then the root port if it differs.
+apply_d3cold_now() {
+	local card port d seen=" "
+	card=$(card_bdf) || return 1
+	port=$(root_port_bdf) || port=""
+
+	for d in "$card" "$port"; do
+		[ -n "$d" ] || continue
+		case "$seen" in *" $d "*) continue ;; esac
+		seen="$seen$d "
+		[ -w "/sys/bus/pci/devices/$d/d3cold_allowed" ] || continue
+		echo 0 >"/sys/bus/pci/devices/$d/d3cold_allowed"
+		grn "d3cold_allowed=0 on $d"
+	done
+	return 0
+}
+
+# --- module handling -----------------------------------------------------
+
+load_modules() {
+	local m
+	for m in "${LOAD_ORDER[@]}"; do
+		modprobe "$m" || die "failed to load $m"
+	done
+}
+
+unload_modules() {
+	local m rc=0
+	for m in "${UNLOAD_ORDER[@]}"; do
+		modprobe -q -r "$m" 2>/dev/null || rc=1
+	done
+	return $rc
+}
+
+reload() {
+	if ! unload_modules; then
+		ylw "some modules stayed loaded (something holds them);"
+		ylw "the new parameters may not have applied. Reboot to be sure."
+	else
+		load_modules
+		grn "reloaded driver modules"
+	fi
+}
+
+# --- recovery ------------------------------------------------------------
+
+cycle_radio() {
+	if have_nm; then
+		nmcli radio wifi off >/dev/null 2>&1 || true
+		sleep 2
+		nmcli radio wifi on >/dev/null 2>&1 || true
+		sleep 3
+	elif have rfkill; then
+		rfkill block wifi 2>/dev/null || true
+		sleep 2
+		rfkill unblock wifi 2>/dev/null || true
+		sleep 3
+	else
+		ylw "no NetworkManager or rfkill; skipping radio cycle"
+	fi
+}
+
+reconnect() {
+	have_nm || return 0
+	local con
+	con=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null |
+		awk -F: '$2 == "802-11-wireless" { print $1; exit }')
+	[ -n "$con" ] && nmcli connection up "$con" >/dev/null 2>&1 || true
+}
+
+# The actual recovery. Once a card is in D3cold no amount of module reloading
+# reaches it, so we remove the device from the PCI bus and rescan to make the
+# kernel probe it again from a cold bus. This is the reboot-equivalent that
+# does not cost you the session.
+pci_power_cycle() {
+	local card
+	card=$(card_bdf) || die "card not present on the bus"
+
+	if [ ! -w "/sys/bus/pci/devices/$card/remove" ]; then
+		die "cannot write to $card/remove (need root)"
+	fi
+
+	echo 1 >"/sys/bus/pci/devices/$card/remove" || die "PCI remove failed"
+	grn "removed $card from the bus"
+	sleep 2
+
+	# The driver has to be gone before the rescan, or the rescan re-binds the
+	# same dead instance.
+	unload_modules || ylw "modules still busy; continuing anyway"
+	sleep 1
+
+	echo 1 >/sys/bus/pci/rescan || die "PCI rescan failed"
+	grn "rescanned the PCI bus"
+
+	# Wait for the kernel to re-enumerate and the driver to rebind.
+	local i
+	for i in $(seq 1 15); do
+		if card_present; then
+			grn "driver rebound after ${i}s"
+			return 0
+		fi
+		sleep 1
+	done
+
+	load_modules
+	sleep 2
+	card_present || red "driver did not rebind after rescan"
+}
+
+heal() {
+	local iface
+
+	echo "attempting recovery..."
+	apply_d3cold_now || true
+
+	# Cheapest first: the radio cycle is enough if the card is only stuck in
+	# low power mode rather than dead on the bus.
+	cycle_radio
+	iface=$(wifi_iface) || iface=""
+	if link_up "$iface"; then
+		grn "the radio cycle was enough"
+		reconnect
+		return 0
+	fi
+	ylw "still down, power-cycling the PCI device"
+	pci_power_cycle
+	apply_d3cold_now || true
+	cycle_radio
+	reconnect
+
+	echo
+	report
+}
+
+remove_everything() {
+	if [ -f "$MODPROBE_CONF" ] && grep -q "$MARKER" "$MODPROBE_CONF"; then
+		rm -f "$MODPROBE_CONF"
+		ylw "removed $MODPROBE_CONF"
+	fi
+	if [ -f "$MODPROBE_BAK" ]; then
+		mv "$MODPROBE_BAK" "$MODPROBE_CONF"
+		grn "restored your original $MODPROBE_CONF"
+	fi
+	if [ -f "$UDEV_RULE" ]; then
+		rm -f "$UDEV_RULE"
+		ylw "removed $UDEV_RULE"
+	fi
+	udevadm control --reload-rules 2>/dev/null || true
+}
+
+# --- entry ---------------------------------------------------------------
+
+usage() {
+	cat <<'EOF'
+rtw89-fix - prevent and recover RTL8852BE (rtw89) WiFi death by PCI D3cold.
+
+Usage: rtw89-fix [option]
+
+  (none), --apply   apply prevention config (safe to re-run; needs root)
+  --heal            recover a wedged card right now (needs root)
+  --check           report state only, no changes, no root
+  --revert          remove every file this script created (needs root)
+  -h, --help        show this help
+
+Supported: Arch-based, Fedora-based, and Ubuntu/Debian-based distros.
+EOF
+}
+
+case "${1:-}" in
+--check)
+	echo "rtl8852be state:"
+	report
+	exit 0
+	;;
+--heal)
+	need_root "$@"
+	ensure_deps
+	heal
+	;;
+--revert)
+	need_root "$@"
+	ensure_deps
+	remove_everything
+	reload
+	cycle_radio
+	echo
+	report
+	exit 0
+	;;
+"" | --apply)
+	need_root "$@"
+	ensure_deps
+	echo "applying rtw89 fix..."
+	write_modprobe_conf
+	write_udev_rule
+	udevadm control --reload-rules 2>/dev/null || true
+	udevadm trigger --subsystem-match=pci 2>/dev/null || true
+	apply_d3cold_now || true
+	reload
+
+	echo
+	report
+	echo
+	bdf=$(card_bdf || echo "")
+	d3=$(cat "/sys/bus/pci/devices/$bdf/d3cold_allowed" 2>/dev/null || echo "?")
+	ps=$(cat /sys/module/rtw89_core/parameters/disable_ps_mode 2>/dev/null || echo "?")
+	if [ "$d3" = "0" ] && [ "$ps" = "Y" ]; then
+		grn "prevention is active: D3cold blocked, low power mode off."
+		grn "If it still dies, run: sudo $0 --heal"
+	else
+		red "prevention incomplete (d3cold=$d3 ps=$ps). Reboot, then --check."
+	fi
+	;;
+-h | --help)
+	usage
+	exit 0
+	;;
+*)
+	red "unknown option: $1"
+	usage
+	exit 1
+	;;
+esac
