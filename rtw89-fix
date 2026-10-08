@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # rtw89-fix - repair the RTL8852BE (rtw89) WiFi card on Linux.
 #
+# Version: see VERSION below.
+VERSION=0.2.0
+#
 # Works on Arch-based, Fedora-based, Ubuntu/Debian-based and openSUSE-based
 # distros. The distro family is detected from /etc/os-release and pacman, dnf,
 # apt or zypper is used to fill in missing dependencies. NetworkManager and iw
@@ -770,6 +773,7 @@ Usage: rtw89-fix [option]
   --dry-run         with --apply or --revert: print every file that would be
                     written or removed and every sysfs value that would
                     change, then change nothing (no root needed)
+  -V, --version     print version and exit
   -h, --help        show this help
 
 Modes:
@@ -846,6 +850,10 @@ for arg in "$@"; do
 		MINIMAL=1
 		;;
 	--dry-run) DRY_RUN=1 ;;
+	-V | --version)
+		echo "rtw89-fix $VERSION"
+		exit 0
+		;;
 	-h | --help)
 		usage
 		exit 0
