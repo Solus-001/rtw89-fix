@@ -262,10 +262,24 @@ link_up() {
 	[ "$(cat "/sys/class/net/$iface/operstate" 2>/dev/null)" = "up" ]
 }
 
+# Human-readable name for a PCI class code, for --check output.
+pci_class_name() {
+	case "$1" in
+	0x060000) echo "host bridge" ;;
+	0x060400) echo "PCI bridge" ;;
+	0x020000) echo "Ethernet controller" ;;
+	0x028000) echo "network controller (wireless)" ;;
+	0x030000) echo "VGA compatible controller" ;;
+	0x0c0320) echo "USB controller" ;;
+	*) echo "class $1" ;;
+	esac
+}
+
 # --- reporting -----------------------------------------------------------
 
 report() {
 	local bdf iface ps d3cold state nmstate drv out
+	local l1ss clkreq parent pclass pd3
 
 	bdf=$(card_bdf) || bdf="not found"
 	iface=$(wifi_iface) || iface="none"
@@ -281,7 +295,19 @@ report() {
 	fi
 
 	ps=$(cat /sys/module/rtw89_core/parameters/disable_ps_mode 2>/dev/null || echo "n/a")
+	l1ss=$(cat /sys/module/rtw89_pci/parameters/disable_aspm_l1ss 2>/dev/null || echo "n/a")
+	clkreq=$(cat /sys/module/rtw89_pci/parameters/disable_clkreq 2>/dev/null || echo "n/a")
 	d3cold=$(cat "/sys/bus/pci/devices/$bdf/d3cold_allowed" 2>/dev/null || echo "n/a")
+	parent=""
+	pclass=""
+	pd3=""
+	if [ "$bdf" != "not found" ]; then
+		parent=$(root_port_bdf 2>/dev/null) || parent=""
+		if [ -n "$parent" ]; then
+			pclass=$(cat "/sys/bus/pci/devices/$parent/class" 2>/dev/null) || pclass=""
+			pd3=$(cat "/sys/bus/pci/devices/$parent/d3cold_allowed" 2>/dev/null) || pd3=""
+		fi
+	fi
 	state="no interface"
 	if [ "$iface" != "none" ]; then
 		if have iw; then
@@ -308,10 +334,22 @@ report() {
 	echo "  interface:       $iface"
 	echo "  link:            $state"
 	echo "  NetworkManager:  $nmstate"
-	echo "  disable_ps_mode: $ps   (want Y)"
-	echo "  d3cold_allowed:  $d3cold   (want 0)"
+	echo "  disable_ps_mode:      $ps   (want Y)"
+	echo "  disable_aspm_l1ss:    $l1ss   (want 1)"
+	echo "  disable_clkreq:       $clkreq   (want 1)"
+	echo "  d3cold card:          $d3cold   (want 0)"
+	if [ -n "$parent" ]; then
+		echo "  parent device:        $parent  $(pci_class_name "$pclass") [$pclass]"
+		echo "  d3cold parent:        $pd3   (want 0)"
+	else
+		echo "  parent device:        n/a (card not on the bus)"
+		echo "  d3cold parent:        n/a"
+	fi
 	if [ "$d3cold" = "1" ]; then
-		echo "  ^^ this is the bug: D3cold is allowed, the card can go dead"
+		echo "  ^^ this is the bug: D3cold is allowed on the card, it can go dead"
+	fi
+	if [ "$pd3" = "1" ]; then
+		echo "  ^^ and on the parent: D3cold is allowed there too"
 	fi
 	echo "  modprobe conf:   $([ -f "$MODPROBE_CONF" ] && echo present || echo absent)"
 	echo "  udev rule:       $([ -f "$UDEV_RULE" ] && echo present || echo absent)"
