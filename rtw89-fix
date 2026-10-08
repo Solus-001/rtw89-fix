@@ -207,10 +207,22 @@ card_present() {
 	[ -d /sys/module/rtw89_8852be ]
 }
 
-# The wireless interface, whatever it ended up being named. It is not always
-# wlan0: after a module reload the old name is freed and the kernel picks the
-# next free one, which is how this card becomes wlan1.
+# The wireless interface, whatever it ended up being named. Ask the card
+# first: /sys/bus/pci/devices/<bdf>/net/ contains exactly the interface this
+# device owns, so it works for predictable names (wlp1s0, wlp3s0, ...) as
+# well as legacy ones (wlan0). It is not always wlan0 either: after a module
+# reload the old name is freed and the kernel picks the next free one, which
+# is how this card becomes wlan1. The wlan* glob is only a fallback for when
+# the card itself cannot be found.
 wifi_iface() {
+	local bdf i
+	if bdf=$(card_bdf); then
+		for i in "/sys/bus/pci/devices/$bdf/net/"*; do
+			[ -e "$i" ] || continue
+			basename "$i"
+			return 0
+		done
+	fi
 	for i in /sys/class/net/wlan*; do
 		[ -e "$i" ] || continue
 		basename "$i"
