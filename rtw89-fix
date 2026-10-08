@@ -198,13 +198,17 @@ root_port_bdf() {
 	printf '%s\n' "$(basename "$parent")"
 }
 
-# Is the chip driver in the kernel?
-# /sys/module appears for loaded modules and built-ins alike, and reading it
-# cannot die of SIGPIPE the way `lsmod | grep -q` can: grep -q exits on the
-# first match, lsmod dies of SIGPIPE, and under `set -o pipefail` that makes
-# a loaded driver report as absent.
+# Is the card actually driven right now? /sys/module/rtw89_8852be is true for
+# a loaded module even when this particular device is unbound, unresponsive or
+# long gone from the bus, so it used to report "driver: loaded" for a card
+# nothing was driving. The binding itself is the driver symlink on the device,
+# which exists only while the driver is attached to THIS device - that is what
+# the rebind wait in pci_power_cycle() has to wait for. Reading a symlink is
+# also immune to the `lsmod | grep -q` SIGPIPE trap under pipefail.
 card_present() {
-	[ -d /sys/module/rtw89_8852be ]
+	local bdf
+	bdf=$(card_bdf) || return 1
+	[ -e "/sys/bus/pci/devices/$bdf/driver" ]
 }
 
 # The wireless interface, whatever it ended up being named. Ask the card
@@ -252,10 +256,20 @@ link_up() {
 # --- reporting -----------------------------------------------------------
 
 report() {
-	local bdf iface ps d3cold state nmstate
+	local bdf iface ps d3cold state nmstate drv
 
 	bdf=$(card_bdf) || bdf="not found"
 	iface=$(wifi_iface) || iface="none"
+
+	# Bound, unbound or gone are three different failures with three
+	# different fixes, so say which one this is.
+	if [ "$bdf" = "not found" ]; then
+		drv="absent (card not on the PCI bus)"
+	elif drv=$(readlink "/sys/bus/pci/devices/$bdf/driver" 2>/dev/null); then
+		drv="bound to $(basename "$drv")"
+	else
+		drv="UNBOUND (on the bus, no driver attached)"
+	fi
 
 	ps=$(cat /sys/module/rtw89_core/parameters/disable_ps_mode 2>/dev/null || echo "n/a")
 	d3cold=$(cat "/sys/bus/pci/devices/$bdf/d3cold_allowed" 2>/dev/null || echo "n/a")
@@ -276,7 +290,7 @@ report() {
 
 	echo "  distro:          $OS_PRETTY"
 	echo "  PCI device:      $bdf"
-	echo "  driver:          $(card_present && echo loaded || echo absent)"
+	echo "  driver:          $drv"
 	echo "  interface:       $iface"
 	echo "  link:            $state"
 	echo "  NetworkManager:  $nmstate"
