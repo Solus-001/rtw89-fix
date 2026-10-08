@@ -673,6 +673,44 @@ heal() {
 	report
 }
 
+# Put D3cold back the way we found it. The udev rule is gone by the time this
+# runs, so this is the last chance to leave the port able to power down
+# again before the next boot re-enumerates everything.
+restore_d3cold_allowed() {
+	local card parent d seen=" "
+	card=$(card_bdf) || card=""
+	parent=""
+	if [ -n "$card" ]; then
+		parent=$(parent_bdf 2>/dev/null) || parent=""
+	fi
+
+	if [ -z "$card" ]; then
+		ylw "card $PCI_ID is not on the bus, nothing to restore. With the udev"
+		ylw "rule gone, D3cold is allowed again from the next boot."
+		return 0
+	fi
+
+	for d in "$card" "$parent"; do
+		[ -n "$d" ] || continue
+		case "$seen" in *" $d "*) continue ;; esac
+		seen="$seen$d "
+		if [ "$DRY_RUN" -eq 1 ]; then
+			dry "set d3cold_allowed=1 on $d"
+			continue
+		fi
+		if [ -w "/sys/bus/pci/devices/$d/d3cold_allowed" ]; then
+			if echo 1 >"/sys/bus/pci/devices/$d/d3cold_allowed"; then
+				grn "d3cold_allowed=1 on $d"
+			else
+				ylw "d3cold_allowed stays 0 on $d until reboot (write failed)"
+			fi
+		else
+			ylw "d3cold_allowed stays 0 on $d until reboot (not writable)"
+		fi
+	done
+	return 0
+}
+
 remove_everything() {
 	remove_managed_conf || true
 	if [ -f "$UDEV_RULE" ]; then
@@ -821,6 +859,7 @@ revert)
 		ensure_deps
 	fi
 	remove_everything
+	restore_d3cold_allowed
 	reload
 	cycle_radio
 	echo
