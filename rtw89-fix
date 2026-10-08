@@ -177,6 +177,27 @@ need_root() {
 	exec sudo env RTW89_FIX_NO_SUDO=1 "$0" "$@"
 }
 
+# --apply and --heal reload the driver, and a reload can take the Wi-Fi link
+# down with it. If this session is carried over that link, the user loses the
+# session - possibly the terminal they are reading this in. Say so before
+# doing anything, and ask before going ahead when there is someone to ask.
+# Non-interactive use (cron, CI) cannot answer, so it only warns.
+warn_ssh() {
+	local action="$1" ans=""
+	[ -n "${SSH_CONNECTION:-}" ] || return 0
+	ylw "warning: this looks like an SSH session ($SSH_CONNECTION)."
+	ylw "$action reloads the rtw89 driver, which can drop the Wi-Fi link"
+	ylw "that is probably carrying this session. You may be disconnected."
+	if [ -t 0 ]; then
+		read -r -p "continue anyway? [y/N] " ans || ans=""
+		case "$ans" in
+		y | Y | yes | YES) return 0 ;;
+		*) die "aborted; answer y (or pipe y) to run $action over SSH" ;;
+		esac
+	fi
+	return 0
+}
+
 # --- PCI discovery -------------------------------------------------------
 
 # The card's BDF, e.g. 0000:01:00.0. Found by matching vendor/device rather
@@ -854,6 +875,7 @@ check)
 heal)
 	need_root "$@"
 	ensure_deps
+	warn_ssh "--heal"
 	heal
 	;;
 revert)
@@ -881,6 +903,7 @@ apply)
 	else
 		need_root "$@"
 		ensure_deps
+		warn_ssh "--apply"
 	fi
 	if [ "$MINIMAL" -eq 1 ]; then
 		echo "applying rtw89 fix (mode: minimal - D3cold block only)"
