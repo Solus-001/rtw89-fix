@@ -243,20 +243,29 @@ have_nm() {
 
 # Is the interface associated with an AP? iw says "Connected to ..." when it
 # is; without iw, fall back to the interface operstate.
+#
+# The output is captured first and tested without a pipeline. Under
+# `set -o pipefail`, `iw ... | grep -q` is a race: grep -q exits on the first
+# match, iw is killed by SIGPIPE, and a perfectly connected link is then
+# reported as down - which is exactly the wrong answer --heal needs.
 link_up() {
-	local iface="$1"
+	local iface="$1" out first
 	[ -n "$iface" ] || return 1
 	if have iw; then
-		iw dev "$iface" link 2>/dev/null | grep -q '^Connected to'
-	else
-		[ "$(cat "/sys/class/net/$iface/operstate" 2>/dev/null)" = "up" ]
+		out=$(iw dev "$iface" link 2>/dev/null) || out=""
+		first=${out%%$'\n'*}
+		case "$first" in
+		"Connected to "*) return 0 ;;
+		*) return 1 ;;
+		esac
 	fi
+	[ "$(cat "/sys/class/net/$iface/operstate" 2>/dev/null)" = "up" ]
 }
 
 # --- reporting -----------------------------------------------------------
 
 report() {
-	local bdf iface ps d3cold state nmstate drv
+	local bdf iface ps d3cold state nmstate drv out
 
 	bdf=$(card_bdf) || bdf="not found"
 	iface=$(wifi_iface) || iface="none"
@@ -276,8 +285,13 @@ report() {
 	state="no interface"
 	if [ "$iface" != "none" ]; then
 		if have iw; then
-			state=$(iw dev "$iface" link 2>/dev/null | head -1 || true)
-			[ -z "$state" ] && state="down, no link"
+			# Same pipefail trap as link_up(): capture first, then read the
+			# first line out of the variable.
+			out=$(iw dev "$iface" link 2>/dev/null) || out=""
+			state=${out%%$'\n'*}
+			if [ -z "$state" ]; then
+				state="down, no link"
+			fi
 		else
 			state="unknown (install iw for link details)"
 		fi
@@ -434,9 +448,20 @@ cycle_radio() {
 
 reconnect() {
 	have_nm || return 0
-	local con
-	con=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null |
-		awk -F: '$2 == "802-11-wireless" { print $1; exit }')
+	local con line out
+	# Capture nmcli's output first, then pick the Wi-Fi connection out of the
+	# variable. Piping straight into awk is a pipefail trap: awk exits on the
+	# first match, nmcli gets SIGPIPE, and the script dies mid-recovery.
+	out=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null) || out=""
+	con=""
+	while IFS= read -r line; do
+		case "$line" in
+		*:802-11-wireless)
+			con=${line%:*}
+			break
+			;;
+		esac
+	done <<<"$out"
 	if [ -n "$con" ]; then
 		nmcli connection up "$con" >/dev/null 2>&1 || true
 	fi
