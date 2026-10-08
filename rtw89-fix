@@ -189,13 +189,46 @@ card_bdf() {
 	return 1
 }
 
-# The PCIe root port the card sits behind. Cutting D3cold here as well is what
-# makes the fix stick on some firmware; D3cold is negotiated port-wide.
-root_port_bdf() {
+# The device the card hangs off: its immediate parent in the sysfs tree.
+#
+# This used to be called root_port_bdf(), and on many machines it is indeed a
+# PCIe root port - but not on all of them. On some laptops the WLAN slot sits
+# behind an intermediate PCIe bridge or a switch port, and the D3cold block
+# has to cover whatever the immediate parent is, because D3cold is negotiated
+# for the whole port subtree. The name now says what the code actually asks
+# for, and --check prints the whole chain (see topology()) so a bug report
+# can show which of the two cases a given machine is.
+parent_bdf() {
 	local bdf parent
 	bdf=$(card_bdf) || return 1
 	parent=$(dirname "$(readlink -f "/sys/bus/pci/devices/$bdf")")
 	printf '%s\n' "$(basename "$parent")"
+}
+
+# The card's ancestry, innermost first, one line per device. This is what
+# someone filing a bug report needs to paste: it shows whether the immediate
+# parent is a root port or a bridge, and how many hops there are.
+topology() {
+	local bdf="$1" indent="    " dev link parent vendor device class first=1
+	while [ -n "$bdf" ]; do
+		dev="/sys/bus/pci/devices/$bdf"
+		vendor=$(cat "$dev/vendor" 2>/dev/null) || vendor=""
+		device=$(cat "$dev/device" 2>/dev/null) || device=""
+		class=$(cat "$dev/class" 2>/dev/null) || class=""
+		if [ "$first" -eq 1 ]; then
+			printf '%s%s  %s:%s  %s   <- the card\n' \
+				"$indent" "$bdf" "$vendor" "$device" "$(pci_class_name "$class")"
+		else
+			printf '%s%s  %s:%s  %s\n' \
+				"$indent" "$bdf" "$vendor" "$device" "$(pci_class_name "$class")"
+		fi
+		first=0
+		indent="$indent  "
+		link=$(readlink -f "$dev" 2>/dev/null) || break
+		parent=$(dirname "$link")
+		[ -f "$parent/vendor" ] || break # root bus: no vendor file
+		bdf=$(basename "$parent")
+	done
 }
 
 # Is the card actually driven right now? /sys/module/rtw89_8852be is true for
@@ -302,7 +335,7 @@ report() {
 	pclass=""
 	pd3=""
 	if [ "$bdf" != "not found" ]; then
-		parent=$(root_port_bdf 2>/dev/null) || parent=""
+		parent=$(parent_bdf 2>/dev/null) || parent=""
 		if [ -n "$parent" ]; then
 			pclass=$(cat "/sys/bus/pci/devices/$parent/class" 2>/dev/null) || pclass=""
 			pd3=$(cat "/sys/bus/pci/devices/$parent/d3cold_allowed" 2>/dev/null) || pd3=""
@@ -344,6 +377,10 @@ report() {
 	else
 		echo "  parent device:        n/a (card not on the bus)"
 		echo "  d3cold parent:        n/a"
+	fi
+	if [ "$bdf" != "not found" ]; then
+		echo "  topology:"
+		topology "$bdf"
 	fi
 	if [ "$d3cold" = "1" ]; then
 		echo "  ^^ this is the bug: D3cold is allowed on the card, it can go dead"
@@ -449,7 +486,7 @@ write_udev_rule() {
 		ylw "the card and its parent as soon as it reappears"
 		return 0
 	fi
-	parent=$(root_port_bdf) || parent=""
+	parent=$(parent_bdf) || parent=""
 	echo "     card:   $card d3cold blocked, matched by PCI ID $PCI_ID"
 	if [ -n "$parent" ] && [ "$parent" != "$card" ]; then
 		echo "     parent: $parent d3cold blocked via the card's sysfs path"
@@ -462,7 +499,7 @@ write_udev_rule() {
 apply_d3cold_now() {
 	local card port d seen=" "
 	card=$(card_bdf) || return 1
-	port=$(root_port_bdf) || port=""
+	port=$(parent_bdf) || port=""
 
 	for d in "$card" "$port"; do
 		[ -n "$d" ] || continue
