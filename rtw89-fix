@@ -303,7 +303,26 @@ write_modprobe_conf() {
 # it. udev is the only hook that runs early enough, at every boot.
 write_udev_rule() {
 	local card port
-	card=$(card_bdf) || die "could not find PCI device $PCI_ID"
+
+	if ! card=$(card_bdf); then
+		# The card is wedged hard enough to have dropped off the bus
+		# entirely. Dying here would leave --apply half done (modprobe conf
+		# written, no udev rule), so write the rule by vendor/device ID
+		# instead: it needs no addresses, and %p is resolved when the event
+		# fires, so the parent port is covered too once the card returns.
+		ylw "card $PCI_ID is not on the PCI bus right now"
+		{
+			echo "# $MARKER. Blocks D3cold, the PCI power state that kills this card."
+			echo "# Written while $PCI_ID was absent from the bus, so it matches"
+			echo "# the vendor/device ID rather than a bus address."
+			echo "SUBSYSTEM==\"pci\", ATTR{vendor}==\"0x${PCI_ID%%:*}\", ATTR{device}==\"0x${PCI_ID##*:}\", ATTR{d3cold_allowed}=\"0\", RUN+=\"/bin/sh -c 'echo 0 > /sys%p/../d3cold_allowed'\""
+		} >"$UDEV_RULE"
+		grn "wrote $UDEV_RULE"
+		echo "     matched by PCI ID $PCI_ID; the parent port is covered by the"
+		echo "     RUN line as soon as the card reappears"
+		return 0
+	fi
+
 	port=$(root_port_bdf) || port=""
 
 	{
@@ -389,7 +408,9 @@ reconnect() {
 	local con
 	con=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null |
 		awk -F: '$2 == "802-11-wireless" { print $1; exit }')
-	[ -n "$con" ] && nmcli connection up "$con" >/dev/null 2>&1 || true
+	if [ -n "$con" ]; then
+		nmcli connection up "$con" >/dev/null 2>&1 || true
+	fi
 }
 
 # The actual recovery. Once a card is in D3cold no amount of module reloading
@@ -397,16 +418,24 @@ reconnect() {
 # kernel probe it again from a cold bus. This is the reboot-equivalent that
 # does not cost you the session.
 pci_power_cycle() {
-	local card
-	card=$(card_bdf) || die "card not present on the bus"
+	local card i vanished=0
 
-	if [ ! -w "/sys/bus/pci/devices/$card/remove" ]; then
-		die "cannot write to $card/remove (need root)"
+	if card=$(card_bdf); then
+		if [ ! -w "/sys/bus/pci/devices/$card/remove" ]; then
+			die "cannot write to $card/remove (need root)"
+		fi
+
+		echo 1 >"/sys/bus/pci/devices/$card/remove" || die "PCI remove failed"
+		grn "removed $card from the bus"
+		sleep 2
+	else
+		# The card fell off the bus completely (full firmware wedge). There
+		# is nothing left to remove, so go straight to the rescan instead of
+		# giving up - giving up here is what made an unhealable card stay
+		# unhealable.
+		ylw "card $PCI_ID is not on the bus; skipping the remove step"
+		vanished=1
 	fi
-
-	echo 1 >"/sys/bus/pci/devices/$card/remove" || die "PCI remove failed"
-	grn "removed $card from the bus"
-	sleep 2
 
 	# The driver has to be gone before the rescan, or the rescan re-binds the
 	# same dead instance.
@@ -416,8 +445,19 @@ pci_power_cycle() {
 	echo 1 >/sys/bus/pci/rescan || die "PCI rescan failed"
 	grn "rescanned the PCI bus"
 
+	if [ "$vanished" -eq 1 ]; then
+		# Let the bus re-enumerate. Only give up if the card is still
+		# missing once that window has closed.
+		for i in $(seq 1 10); do
+			card_bdf >/dev/null && break
+			sleep 1
+		done
+		card_bdf >/dev/null ||
+			die "card $PCI_ID is still absent from the PCI bus after the rescan"
+		grn "card is back on the bus"
+	fi
+
 	# Wait for the kernel to re-enumerate and the driver to rebind.
-	local i
 	for i in $(seq 1 15); do
 		if card_present; then
 			grn "driver rebound after ${i}s"
@@ -526,13 +566,22 @@ case "${1:-}" in
 	report
 	echo
 	bdf=$(card_bdf || echo "")
-	d3=$(cat "/sys/bus/pci/devices/$bdf/d3cold_allowed" 2>/dev/null || echo "?")
-	ps=$(cat /sys/module/rtw89_core/parameters/disable_ps_mode 2>/dev/null || echo "?")
-	if [ "$d3" = "0" ] && [ "$ps" = "Y" ]; then
-		grn "prevention is active: D3cold blocked, low power mode off."
-		grn "If it still dies, run: sudo $0 --heal"
+	if [ -z "$bdf" ]; then
+		# Nothing installed is wrong; there is just no device to point it
+		# at yet. The udev rule matches by ID, so it applies itself when
+		# the card comes back.
+		ylw "card $PCI_ID is not on the PCI bus right now."
+		ylw "prevention files are installed and will match it when it reappears."
+		ylw "run --check then to confirm."
 	else
-		red "prevention incomplete (d3cold=$d3 ps=$ps). Reboot, then --check."
+		d3=$(cat "/sys/bus/pci/devices/$bdf/d3cold_allowed" 2>/dev/null || echo "?")
+		ps=$(cat /sys/module/rtw89_core/parameters/disable_ps_mode 2>/dev/null || echo "?")
+		if [ "$d3" = "0" ] && [ "$ps" = "Y" ]; then
+			grn "prevention is active: D3cold blocked, low power mode off."
+			grn "If it still dies, run: sudo $0 --heal"
+		else
+			red "prevention incomplete (d3cold=$d3 ps=$ps). Reboot, then --check."
+		fi
 	fi
 	;;
 -h | --help)
