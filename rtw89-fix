@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # rtw89-fix - repair the RTL8852BE (rtw89) WiFi card on Linux.
 #
-# Works on Arch-based, Fedora-based, and Ubuntu/Debian-based distros. The
-# distro family is detected from /etc/os-release and pacman, dnf, or apt is
-# used to fill in missing dependencies. NetworkManager and iw are optional:
-# on iwd / systemd-networkd setups the script degrades gracefully instead of
-# failing.
+# Version: see VERSION below.
+VERSION=0.2.0
+#
+# Works on Arch-based, Fedora-based, Ubuntu/Debian-based and openSUSE-based
+# distros. The distro family is detected from /etc/os-release and pacman, dnf,
+# apt or zypper is used to fill in missing dependencies. NetworkManager and iw
+# are optional: on iwd / systemd-networkd setups the script degrades
+# gracefully instead of failing.
 #
 # WHY THE OLD APPROACH FAILED
 # ---------------------------
@@ -66,7 +69,10 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # Distro detection, from the freedesktop-standard /etc/os-release that every
 # systemd distro ships. ID_LIKE catches derivatives: Manjaro says "arch",
-# Mint says "ubuntu debian", Rocky/Alma say "rhel centos fedora".
+# Mint says "ubuntu debian", Rocky/Alma say "rhel centos fedora", openSUSE
+# Leap says ID="opensuse-leap" ID_LIKE="suse opensuse", Tumbleweed says
+# ID="opensuse-tumbleweed" ID_LIKE="opensuse suse" and SLES says ID="sles"
+# ID_LIKE="suse" - matching either suse token catches the whole family.
 OS_ID=unknown
 OS_LIKE=""
 OS_PRETTY="unknown distro"
@@ -83,6 +89,7 @@ distro_family() {
 	*" arch "*) echo arch ;;
 	*" fedora "* | *" rhel "* | *" centos "*) echo fedora ;;
 	*" debian "* | *" ubuntu "*) echo debian ;;
+	*" suse "* | *" opensuse "*) echo suse ;;
 	*) echo unknown ;;
 	esac
 }
@@ -94,6 +101,7 @@ pkg_manager() {
 	arch) echo "pacman -S --needed" ;;
 	fedora) echo "dnf install" ;;
 	debian) echo "apt-get install" ;;
+	suse) echo "zypper install" ;;
 	esac
 }
 
@@ -106,7 +114,7 @@ pkg_for() {
 	iw) echo iw ;;
 	rfkill)
 		case "$family" in
-		debian) echo rfkill ;;
+		debian | suse) echo rfkill ;;
 		*) echo util-linux ;;
 		esac
 		;;
@@ -114,7 +122,6 @@ pkg_for() {
 		case "$family" in
 		arch) echo systemd ;;
 		fedora) echo systemd-udev ;;
-		debian) echo udev ;;
 		*) echo udev ;;
 		esac
 		;;
@@ -173,6 +180,27 @@ need_root() {
 	exec sudo env RTW89_FIX_NO_SUDO=1 "$0" "$@"
 }
 
+# --apply and --heal reload the driver, and a reload can take the Wi-Fi link
+# down with it. If this session is carried over that link, the user loses the
+# session - possibly the terminal they are reading this in. Say so before
+# doing anything, and ask before going ahead when there is someone to ask.
+# Non-interactive use (cron, CI) cannot answer, so it only warns.
+warn_ssh() {
+	local action="$1" ans=""
+	[ -n "${SSH_CONNECTION:-}" ] || return 0
+	ylw "warning: this looks like an SSH session ($SSH_CONNECTION)."
+	ylw "$action reloads the rtw89 driver, which can drop the Wi-Fi link"
+	ylw "that is probably carrying this session. You may be disconnected."
+	if [ -t 0 ]; then
+		read -r -p "continue anyway? [y/N] " ans || ans=""
+		case "$ans" in
+		y | Y | yes | YES) return 0 ;;
+		*) die "aborted; answer y (or pipe y) to run $action over SSH" ;;
+		esac
+	fi
+	return 0
+}
+
 # --- PCI discovery -------------------------------------------------------
 
 # The card's BDF, e.g. 0000:01:00.0. Found by matching vendor/device rather
@@ -189,28 +217,77 @@ card_bdf() {
 	return 1
 }
 
-# The PCIe root port the card sits behind. Cutting D3cold here as well is what
-# makes the fix stick on some firmware; D3cold is negotiated port-wide.
-root_port_bdf() {
+# The device the card hangs off: its immediate parent in the sysfs tree.
+#
+# This used to be called root_port_bdf(), and on many machines it is indeed a
+# PCIe root port - but not on all of them. On some laptops the WLAN slot sits
+# behind an intermediate PCIe bridge or a switch port, and the D3cold block
+# has to cover whatever the immediate parent is, because D3cold is negotiated
+# for the whole port subtree. The name now says what the code actually asks
+# for, and --check prints the whole chain (see topology()) so a bug report
+# can show which of the two cases a given machine is.
+parent_bdf() {
 	local bdf parent
 	bdf=$(card_bdf) || return 1
 	parent=$(dirname "$(readlink -f "/sys/bus/pci/devices/$bdf")")
 	printf '%s\n' "$(basename "$parent")"
 }
 
-# Is the chip driver in the kernel?
-# /sys/module appears for loaded modules and built-ins alike, and reading it
-# cannot die of SIGPIPE the way `lsmod | grep -q` can: grep -q exits on the
-# first match, lsmod dies of SIGPIPE, and under `set -o pipefail` that makes
-# a loaded driver report as absent.
-card_present() {
-	[ -d /sys/module/rtw89_8852be ]
+# The card's ancestry, innermost first, one line per device. This is what
+# someone filing a bug report needs to paste: it shows whether the immediate
+# parent is a root port or a bridge, and how many hops there are.
+topology() {
+	local bdf="$1" indent="    " dev link parent vendor device class first=1
+	while [ -n "$bdf" ]; do
+		dev="/sys/bus/pci/devices/$bdf"
+		vendor=$(cat "$dev/vendor" 2>/dev/null) || vendor=""
+		device=$(cat "$dev/device" 2>/dev/null) || device=""
+		class=$(cat "$dev/class" 2>/dev/null) || class=""
+		if [ "$first" -eq 1 ]; then
+			printf '%s%s  %s:%s  %s   <- the card\n' \
+				"$indent" "$bdf" "$vendor" "$device" "$(pci_class_name "$class")"
+		else
+			printf '%s%s  %s:%s  %s\n' \
+				"$indent" "$bdf" "$vendor" "$device" "$(pci_class_name "$class")"
+		fi
+		first=0
+		indent="$indent  "
+		link=$(readlink -f "$dev" 2>/dev/null) || break
+		parent=$(dirname "$link")
+		[ -f "$parent/vendor" ] || break # root bus: no vendor file
+		bdf=$(basename "$parent")
+	done
 }
 
-# The wireless interface, whatever it ended up being named. It is not always
-# wlan0: after a module reload the old name is freed and the kernel picks the
-# next free one, which is how this card becomes wlan1.
+# Is the card actually driven right now? /sys/module/rtw89_8852be is true for
+# a loaded module even when this particular device is unbound, unresponsive or
+# long gone from the bus, so it used to report "driver: loaded" for a card
+# nothing was driving. The binding itself is the driver symlink on the device,
+# which exists only while the driver is attached to THIS device - that is what
+# the rebind wait in pci_power_cycle() has to wait for. Reading a symlink is
+# also immune to the `lsmod | grep -q` SIGPIPE trap under pipefail.
+card_present() {
+	local bdf
+	bdf=$(card_bdf) || return 1
+	[ -e "/sys/bus/pci/devices/$bdf/driver" ]
+}
+
+# The wireless interface, whatever it ended up being named. Ask the card
+# first: /sys/bus/pci/devices/<bdf>/net/ contains exactly the interface this
+# device owns, so it works for predictable names (wlp1s0, wlp3s0, ...) as
+# well as legacy ones (wlan0). It is not always wlan0 either: after a module
+# reload the old name is freed and the kernel picks the next free one, which
+# is how this card becomes wlan1. The wlan* glob is only a fallback for when
+# the card itself cannot be found.
 wifi_iface() {
+	local bdf i
+	if bdf=$(card_bdf); then
+		for i in "/sys/bus/pci/devices/$bdf/net/"*; do
+			[ -e "$i" ] || continue
+			basename "$i"
+			return 0
+		done
+	fi
 	for i in /sys/class/net/wlan*; do
 		[ -e "$i" ] || continue
 		basename "$i"
@@ -227,31 +304,81 @@ have_nm() {
 
 # Is the interface associated with an AP? iw says "Connected to ..." when it
 # is; without iw, fall back to the interface operstate.
+#
+# The output is captured first and tested without a pipeline. Under
+# `set -o pipefail`, `iw ... | grep -q` is a race: grep -q exits on the first
+# match, iw is killed by SIGPIPE, and a perfectly connected link is then
+# reported as down - which is exactly the wrong answer --heal needs.
 link_up() {
-	local iface="$1"
+	local iface="$1" out first
 	[ -n "$iface" ] || return 1
 	if have iw; then
-		iw dev "$iface" link 2>/dev/null | grep -q '^Connected to'
-	else
-		[ "$(cat "/sys/class/net/$iface/operstate" 2>/dev/null)" = "up" ]
+		out=$(iw dev "$iface" link 2>/dev/null) || out=""
+		first=${out%%$'\n'*}
+		case "$first" in
+		"Connected to "*) return 0 ;;
+		*) return 1 ;;
+		esac
 	fi
+	[ "$(cat "/sys/class/net/$iface/operstate" 2>/dev/null)" = "up" ]
+}
+
+# Human-readable name for a PCI class code, for --check output.
+pci_class_name() {
+	case "$1" in
+	0x060000) echo "host bridge" ;;
+	0x060400) echo "PCI bridge" ;;
+	0x020000) echo "Ethernet controller" ;;
+	0x028000) echo "network controller (wireless)" ;;
+	0x030000) echo "VGA compatible controller" ;;
+	0x0c0320) echo "USB controller" ;;
+	*) echo "class $1" ;;
+	esac
 }
 
 # --- reporting -----------------------------------------------------------
 
 report() {
-	local bdf iface ps d3cold state nmstate
+	local bdf iface ps d3cold state nmstate drv out
+	local l1ss clkreq parent pclass pd3
 
 	bdf=$(card_bdf) || bdf="not found"
 	iface=$(wifi_iface) || iface="none"
 
+	# Bound, unbound or gone are three different failures with three
+	# different fixes, so say which one this is.
+	if [ "$bdf" = "not found" ]; then
+		drv="absent (card not on the PCI bus)"
+	elif drv=$(readlink "/sys/bus/pci/devices/$bdf/driver" 2>/dev/null); then
+		drv="bound to $(basename "$drv")"
+	else
+		drv="UNBOUND (on the bus, no driver attached)"
+	fi
+
 	ps=$(cat /sys/module/rtw89_core/parameters/disable_ps_mode 2>/dev/null || echo "n/a")
+	l1ss=$(cat /sys/module/rtw89_pci/parameters/disable_aspm_l1ss 2>/dev/null || echo "n/a")
+	clkreq=$(cat /sys/module/rtw89_pci/parameters/disable_clkreq 2>/dev/null || echo "n/a")
 	d3cold=$(cat "/sys/bus/pci/devices/$bdf/d3cold_allowed" 2>/dev/null || echo "n/a")
+	parent=""
+	pclass=""
+	pd3=""
+	if [ "$bdf" != "not found" ]; then
+		parent=$(parent_bdf 2>/dev/null) || parent=""
+		if [ -n "$parent" ]; then
+			pclass=$(cat "/sys/bus/pci/devices/$parent/class" 2>/dev/null) || pclass=""
+			pd3=$(cat "/sys/bus/pci/devices/$parent/d3cold_allowed" 2>/dev/null) || pd3=""
+		fi
+	fi
 	state="no interface"
 	if [ "$iface" != "none" ]; then
 		if have iw; then
-			state=$(iw dev "$iface" link 2>/dev/null | head -1 || true)
-			[ -z "$state" ] && state="down, no link"
+			# Same pipefail trap as link_up(): capture first, then read the
+			# first line out of the variable.
+			out=$(iw dev "$iface" link 2>/dev/null) || out=""
+			state=${out%%$'\n'*}
+			if [ -z "$state" ]; then
+				state="down, no link"
+			fi
 		else
 			state="unknown (install iw for link details)"
 		fi
@@ -264,60 +391,137 @@ report() {
 
 	echo "  distro:          $OS_PRETTY"
 	echo "  PCI device:      $bdf"
-	echo "  driver:          $(card_present && echo loaded || echo absent)"
+	echo "  driver:          $drv"
 	echo "  interface:       $iface"
 	echo "  link:            $state"
 	echo "  NetworkManager:  $nmstate"
-	echo "  disable_ps_mode: $ps   (want Y)"
-	echo "  d3cold_allowed:  $d3cold   (want 0)"
+	echo "  disable_ps_mode:      $ps   (want Y)"
+	echo "  disable_aspm_l1ss:    $l1ss   (want 1)"
+	echo "  disable_clkreq:       $clkreq   (want 1)"
+	echo "  d3cold card:          $d3cold   (want 0)"
+	if [ -n "$parent" ]; then
+		echo "  parent device:        $parent  $(pci_class_name "$pclass") [$pclass]"
+		echo "  d3cold parent:        $pd3   (want 0)"
+	else
+		echo "  parent device:        n/a (card not on the bus)"
+		echo "  d3cold parent:        n/a"
+	fi
+	if [ "$bdf" != "not found" ]; then
+		echo "  topology:"
+		topology "$bdf"
+	fi
 	if [ "$d3cold" = "1" ]; then
-		echo "  ^^ this is the bug: D3cold is allowed, the card can go dead"
+		echo "  ^^ this is the bug: D3cold is allowed on the card, it can go dead"
+	fi
+	if [ "$pd3" = "1" ]; then
+		echo "  ^^ and on the parent: D3cold is allowed there too"
 	fi
 	echo "  modprobe conf:   $([ -f "$MODPROBE_CONF" ] && echo present || echo absent)"
 	echo "  udev rule:       $([ -f "$UDEV_RULE" ] && echo present || echo absent)"
+	case "$(installed_mode)" in
+	full)
+		echo "  mode:            full (D3cold block + modprobe options + btusb softdep)"
+		;;
+	minimal)
+		echo "  mode:            minimal (D3cold block only)"
+		;;
+	*)
+		echo "  mode:            none (no rtw89-fix files installed)"
+		;;
+	esac
 }
 
 # --- prevention ----------------------------------------------------------
 
+# Announce a side effect instead of performing it. Every mutating step in this
+# script goes through here when --dry-run is on, so the dry run lists exactly
+# what a real run would do - and nothing else.
+dry() { printf '  would %s\n' "$*"; }
+
+# The modprobe conf, as it would be written. Shared by the real writer and by
+# --dry-run, which prints it instead of writing it.
+modprobe_conf_contents() {
+	echo "# $MARKER. Do not edit by hand; rerun rtw89-fix."
+	echo "# disable_ps_mode stops the firmware entering LPS, which is what"
+	echo "# leaves the xtal stuck. The aspm/clkreq lines stop the PCIe link"
+	echo "# dropping into L1ss across suspend."
+	echo "options rtw89_core disable_ps_mode=1"
+	echo "options rtw89_pci disable_aspm_l1ss=1 disable_clkreq=1"
+	# Load after btusb uploads its firmware. The combo card shares one
+	# RF frontend with Bluetooth; racing init makes coexistence flaky.
+	echo "softdep rtw89_8852be pre: btusb"
+	echo "softdep rtw89_pci pre: btusb"
+}
+
 write_modprobe_conf() {
+	if [ "$DRY_RUN" -eq 1 ]; then
+		if [ -f "$MODPROBE_CONF" ] && ! grep -q "$MARKER" "$MODPROBE_CONF"; then
+			dry "back up $MODPROBE_CONF to $MODPROBE_BAK"
+		fi
+		dry "write $MODPROBE_CONF:"
+		modprobe_conf_contents | sed 's/^/    /'
+		return 0
+	fi
 	if [ -f "$MODPROBE_CONF" ] && ! grep -q "$MARKER" "$MODPROBE_CONF"; then
 		ylw "backing up your existing $MODPROBE_CONF"
 		cp -a "$MODPROBE_CONF" "$MODPROBE_BAK"
 	fi
-	{
-		echo "# $MARKER. Do not edit by hand; rerun rtw89-fix."
-		echo "# disable_ps_mode stops the firmware entering LPS, which is what"
-		echo "# leaves the xtal stuck. The aspm/clkreq lines stop the PCIe link"
-		echo "# dropping into L1ss across suspend."
-		echo "options rtw89_core disable_ps_mode=1"
-		echo "options rtw89_pci disable_aspm_l1ss=1 disable_clkreq=1"
-		# Load after btusb uploads its firmware. The combo card shares one
-		# RF frontend with Bluetooth; racing init makes coexistence flaky.
-		echo "softdep rtw89_8852be pre: btusb"
-		echo "softdep rtw89_pci pre: btusb"
-	} >"$MODPROBE_CONF"
+	modprobe_conf_contents >"$MODPROBE_CONF"
 	grn "wrote $MODPROBE_CONF"
 }
 
 # d3cold_allowed lives on the PCI device, so a modprobe option cannot reach
 # it. udev is the only hook that runs early enough, at every boot.
+#
+# The rule matches the card by vendor/device ID rather than by
+# KERNEL=="<bdf>": bus addresses move when firmware, a dock or a BIOS update
+# re-enumerates the bus, and a hardcoded line then blocks D3cold on whatever
+# landed at that address instead of on this card. The immediate parent (a
+# root port, or a bridge on laptops that hang the WLAN slot off one) is
+# reached through %p at event time, so it is never pinned either.
+#
+# Checked on the author's machine, systemd 262: `udevadm verify` passes, and
+# `udevadm test -v /sys/bus/pci/devices/0000:01:00.0` shows SUBSYSTEM,
+# ATTR{vendor} and ATTR{device} all PASS, ATTR{d3cold_allowed}="0" read as a
+# sysfs write, and the RUN command queued with the parent path expanded to
+# /sys/devices/pci0000:00/0000:00:02.2/0000:01:00.0/../d3cold_allowed.
+#
+# udevadm test never runs RUN commands, so that only proves parsing. The rule
+# firing for real was confirmed on a reboot on the author's machine, where the
+# rule file predated the boot and both d3cold_allowed values still read 0 -
+# an attribute that resets to 1 at every enumeration, so udev wrote both.
+# The udev rule, as it would be written.
+udev_rule_contents() {
+	echo "# $MARKER. Blocks D3cold, the PCI power state that kills this card."
+	echo "# Matched by PCI ID $PCI_ID rather than by bus address: bus numbers"
+	echo "# move between boots, and the card can be absent when this is written."
+	echo "# %p is the card's sysfs path when the event fires, so the RUN line"
+	echo "# also reaches its immediate parent without that address being pinned."
+	echo "SUBSYSTEM==\"pci\", ATTR{vendor}==\"0x${PCI_ID%%:*}\", ATTR{device}==\"0x${PCI_ID##*:}\", ATTR{d3cold_allowed}=\"0\", RUN+=\"/bin/sh -c 'echo 0 > /sys%p/../d3cold_allowed'\""
+}
+
 write_udev_rule() {
-	local card port
-	card=$(card_bdf) || die "could not find PCI device $PCI_ID"
-	port=$(root_port_bdf) || port=""
+	local card parent
+	card=$(card_bdf) || card=""
 
-	{
-		echo "# $MARKER. Blocks D3cold, the PCI power state that kills this card."
-		echo "SUBSYSTEM==\"pci\", KERNEL==\"$card\", ATTR{d3cold_allowed}=\"0\""
-		if [ -n "$port" ] && [ "$port" != "$card" ]; then
-			echo "SUBSYSTEM==\"pci\", KERNEL==\"$port\", ATTR{d3cold_allowed}=\"0\""
-		fi
-	} >"$UDEV_RULE"
+	if [ "$DRY_RUN" -eq 1 ]; then
+		dry "write $UDEV_RULE:"
+		udev_rule_contents | sed 's/^/    /'
+	else
+		udev_rule_contents >"$UDEV_RULE"
+		grn "wrote $UDEV_RULE"
+	fi
 
-	grn "wrote $UDEV_RULE"
-	echo "     card:  $card d3cold blocked"
-	[ -n "$port" ] && [ "$port" != "$card" ] &&
-		echo "     port:  $port d3cold blocked"
+	if [ -z "$card" ]; then
+		ylw "card $PCI_ID is not on the PCI bus right now; the rule will match"
+		ylw "the card and its parent as soon as it reappears"
+		return 0
+	fi
+	parent=$(parent_bdf) || parent=""
+	echo "     card:   $card d3cold blocked, matched by PCI ID $PCI_ID"
+	if [ -n "$parent" ] && [ "$parent" != "$card" ]; then
+		echo "     parent: $parent d3cold blocked via the card's sysfs path"
+	fi
 	return 0
 }
 
@@ -326,12 +530,16 @@ write_udev_rule() {
 apply_d3cold_now() {
 	local card port d seen=" "
 	card=$(card_bdf) || return 1
-	port=$(root_port_bdf) || port=""
+	port=$(parent_bdf) || port=""
 
 	for d in "$card" "$port"; do
 		[ -n "$d" ] || continue
 		case "$seen" in *" $d "*) continue ;; esac
 		seen="$seen$d "
+		if [ "$DRY_RUN" -eq 1 ]; then
+			dry "set d3cold_allowed=0 on $d"
+			continue
+		fi
 		[ -w "/sys/bus/pci/devices/$d/d3cold_allowed" ] || continue
 		echo 0 >"/sys/bus/pci/devices/$d/d3cold_allowed"
 		grn "d3cold_allowed=0 on $d"
@@ -357,6 +565,10 @@ unload_modules() {
 }
 
 reload() {
+	if [ "$DRY_RUN" -eq 1 ]; then
+		dry "reload the rtw89 driver modules (unload ${UNLOAD_ORDER[*]}, load ${LOAD_ORDER[*]})"
+		return 0
+	fi
 	if ! unload_modules; then
 		ylw "some modules stayed loaded (something holds them);"
 		ylw "the new parameters may not have applied. Reboot to be sure."
@@ -369,6 +581,10 @@ reload() {
 # --- recovery ------------------------------------------------------------
 
 cycle_radio() {
+	if [ "$DRY_RUN" -eq 1 ]; then
+		dry "cycle the Wi-Fi radio (NetworkManager or rfkill)"
+		return 0
+	fi
 	if have_nm; then
 		nmcli radio wifi off >/dev/null 2>&1 || true
 		sleep 2
@@ -386,10 +602,23 @@ cycle_radio() {
 
 reconnect() {
 	have_nm || return 0
-	local con
-	con=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null |
-		awk -F: '$2 == "802-11-wireless" { print $1; exit }')
-	[ -n "$con" ] && nmcli connection up "$con" >/dev/null 2>&1 || true
+	local con line out
+	# Capture nmcli's output first, then pick the Wi-Fi connection out of the
+	# variable. Piping straight into awk is a pipefail trap: awk exits on the
+	# first match, nmcli gets SIGPIPE, and the script dies mid-recovery.
+	out=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null) || out=""
+	con=""
+	while IFS= read -r line; do
+		case "$line" in
+		*:802-11-wireless)
+			con=${line%:*}
+			break
+			;;
+		esac
+	done <<<"$out"
+	if [ -n "$con" ]; then
+		nmcli connection up "$con" >/dev/null 2>&1 || true
+	fi
 }
 
 # The actual recovery. Once a card is in D3cold no amount of module reloading
@@ -397,16 +626,24 @@ reconnect() {
 # kernel probe it again from a cold bus. This is the reboot-equivalent that
 # does not cost you the session.
 pci_power_cycle() {
-	local card
-	card=$(card_bdf) || die "card not present on the bus"
+	local card i vanished=0
 
-	if [ ! -w "/sys/bus/pci/devices/$card/remove" ]; then
-		die "cannot write to $card/remove (need root)"
+	if card=$(card_bdf); then
+		if [ ! -w "/sys/bus/pci/devices/$card/remove" ]; then
+			die "cannot write to $card/remove (need root)"
+		fi
+
+		echo 1 >"/sys/bus/pci/devices/$card/remove" || die "PCI remove failed"
+		grn "removed $card from the bus"
+		sleep 2
+	else
+		# The card fell off the bus completely (full firmware wedge). There
+		# is nothing left to remove, so go straight to the rescan instead of
+		# giving up - giving up here is what made an unhealable card stay
+		# unhealable.
+		ylw "card $PCI_ID is not on the bus; skipping the remove step"
+		vanished=1
 	fi
-
-	echo 1 >"/sys/bus/pci/devices/$card/remove" || die "PCI remove failed"
-	grn "removed $card from the bus"
-	sleep 2
 
 	# The driver has to be gone before the rescan, or the rescan re-binds the
 	# same dead instance.
@@ -416,8 +653,19 @@ pci_power_cycle() {
 	echo 1 >/sys/bus/pci/rescan || die "PCI rescan failed"
 	grn "rescanned the PCI bus"
 
+	if [ "$vanished" -eq 1 ]; then
+		# Let the bus re-enumerate. Only give up if the card is still
+		# missing once that window has closed.
+		for i in $(seq 1 10); do
+			card_bdf >/dev/null && break
+			sleep 1
+		done
+		card_bdf >/dev/null ||
+			die "card $PCI_ID is still absent from the PCI bus after the rescan"
+		grn "card is back on the bus"
+	fi
+
 	# Wait for the kernel to re-enumerate and the driver to rebind.
-	local i
 	for i in $(seq 1 15); do
 		if card_present; then
 			grn "driver rebound after ${i}s"
@@ -456,20 +704,59 @@ heal() {
 	report
 }
 
+# Put D3cold back the way we found it. The udev rule is gone by the time this
+# runs, so this is the last chance to leave the port able to power down
+# again before the next boot re-enumerates everything.
+restore_d3cold_allowed() {
+	local card parent d seen=" "
+	card=$(card_bdf) || card=""
+	parent=""
+	if [ -n "$card" ]; then
+		parent=$(parent_bdf 2>/dev/null) || parent=""
+	fi
+
+	if [ -z "$card" ]; then
+		ylw "card $PCI_ID is not on the bus, nothing to restore. With the udev"
+		ylw "rule gone, D3cold is allowed again from the next boot."
+		return 0
+	fi
+
+	for d in "$card" "$parent"; do
+		[ -n "$d" ] || continue
+		case "$seen" in *" $d "*) continue ;; esac
+		seen="$seen$d "
+		if [ "$DRY_RUN" -eq 1 ]; then
+			dry "set d3cold_allowed=1 on $d"
+			continue
+		fi
+		if [ -w "/sys/bus/pci/devices/$d/d3cold_allowed" ]; then
+			if echo 1 >"/sys/bus/pci/devices/$d/d3cold_allowed"; then
+				grn "d3cold_allowed=1 on $d"
+			else
+				ylw "d3cold_allowed stays 0 on $d until reboot (write failed)"
+			fi
+		else
+			ylw "d3cold_allowed stays 0 on $d until reboot (not writable)"
+		fi
+	done
+	return 0
+}
+
 remove_everything() {
-	if [ -f "$MODPROBE_CONF" ] && grep -q "$MARKER" "$MODPROBE_CONF"; then
-		rm -f "$MODPROBE_CONF"
-		ylw "removed $MODPROBE_CONF"
-	fi
-	if [ -f "$MODPROBE_BAK" ]; then
-		mv "$MODPROBE_BAK" "$MODPROBE_CONF"
-		grn "restored your original $MODPROBE_CONF"
-	fi
+	remove_managed_conf || true
 	if [ -f "$UDEV_RULE" ]; then
-		rm -f "$UDEV_RULE"
-		ylw "removed $UDEV_RULE"
+		if [ "$DRY_RUN" -eq 1 ]; then
+			dry "remove $UDEV_RULE"
+		else
+			rm -f "$UDEV_RULE"
+			ylw "removed $UDEV_RULE"
+		fi
 	fi
-	udevadm control --reload-rules 2>/dev/null || true
+	if [ "$DRY_RUN" -eq 1 ]; then
+		dry "run: udevadm control --reload-rules"
+	else
+		udevadm control --reload-rules 2>/dev/null || true
+	fi
 }
 
 # --- entry ---------------------------------------------------------------
@@ -484,64 +771,209 @@ Usage: rtw89-fix [option]
   --heal            recover a wedged card right now (needs root)
   --check           report state only, no changes, no root
   --revert          remove every file this script created (needs root)
+  --minimal         apply only the D3cold block: no modprobe options and no
+                    btusb softdep (implies --apply)
+  --dry-run         with --apply or --revert: print every file that would be
+                    written or removed and every sysfs value that would
+                    change, then change nothing (no root needed)
+  -V, --version     print version and exit
   -h, --help        show this help
 
-Supported: Arch-based, Fedora-based, and Ubuntu/Debian-based distros.
+Modes:
+  full     D3cold block + modprobe options (disable_ps_mode, L1ss/clkreq) +
+           btusb softdep. This is the default.
+  minimal  D3cold block only. Use this if the modprobe options cause
+           trouble on your machine.
+
+Supported: Arch-based, Fedora-based, Ubuntu/Debian-based and openSUSE-based
+distros.
 EOF
 }
 
-case "${1:-}" in
---check)
+# Which mode the installed files correspond to. The udev rule is the same in
+# both modes, so only the modprobe conf tells them apart: a conf carrying our
+# marker means full mode was applied, a rule without one means minimal.
+installed_mode() {
+	if [ -f "$MODPROBE_CONF" ] && grep -q "$MARKER" "$MODPROBE_CONF"; then
+		echo full
+	elif [ -f "$UDEV_RULE" ] && grep -q "$MARKER" "$UDEV_RULE"; then
+		echo minimal
+	else
+		echo none
+	fi
+}
+
+# Remove the modprobe conf this script wrote, restoring the backup of the
+# user's own file if we took one. Shared by --minimal, which must not leave
+# full-mode options behind, and by --revert.
+remove_managed_conf() {
+	if [ -f "$MODPROBE_CONF" ] && grep -q "$MARKER" "$MODPROBE_CONF"; then
+		if [ "$DRY_RUN" -eq 1 ]; then
+			dry "remove $MODPROBE_CONF"
+			[ -f "$MODPROBE_BAK" ] && dry "restore $MODPROBE_BAK to $MODPROBE_CONF"
+			return 0
+		fi
+		rm -f "$MODPROBE_CONF"
+		ylw "removed $MODPROBE_CONF"
+		if [ -f "$MODPROBE_BAK" ]; then
+			mv "$MODPROBE_BAK" "$MODPROBE_CONF"
+			grn "restored your original $MODPROBE_CONF"
+		fi
+		return 0
+	fi
+	return 1
+}
+
+ACTION=""
+MINIMAL=0
+DRY_RUN=0
+
+set_action() {
+	if [ "$MINIMAL" -eq 1 ] && [ "$1" != "apply" ]; then
+		die "--minimal only applies to --apply (not --$1)"
+	fi
+	case "$ACTION" in
+	"") ACTION="$1" ;;
+	"$1") ;; # the same action twice is harmless
+	*) die "conflicting options: --$ACTION and --$1" ;;
+	esac
+}
+
+for arg in "$@"; do
+	case "$arg" in
+	--apply) set_action apply ;;
+	--heal) set_action heal ;;
+	--check) set_action check ;;
+	--revert) set_action revert ;;
+	--minimal)
+		case "$ACTION" in
+		"" | apply) ;;
+		*) die "--minimal only applies to --apply (not --$ACTION)" ;;
+		esac
+		MINIMAL=1
+		;;
+	--dry-run) DRY_RUN=1 ;;
+	-V | --version)
+		echo "rtw89-fix $VERSION"
+		exit 0
+		;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	*)
+		red "unknown option: $arg"
+		usage
+		exit 1
+		;;
+	esac
+done
+[ -z "$ACTION" ] && ACTION=apply
+
+if [ "$DRY_RUN" -eq 1 ]; then
+	case "$ACTION" in
+	apply | revert) ;;
+	*) die "--dry-run is only supported with --apply and --revert (not --$ACTION)" ;;
+	esac
+fi
+
+case "$ACTION" in
+check)
 	echo "rtl8852be state:"
 	report
 	exit 0
 	;;
---heal)
+heal)
 	need_root "$@"
 	ensure_deps
+	warn_ssh "--heal"
 	heal
 	;;
---revert)
-	need_root "$@"
-	ensure_deps
+revert)
+	if [ "$DRY_RUN" -eq 1 ]; then
+		echo "dry run: nothing will be written, removed or changed"
+	else
+		need_root "$@"
+		ensure_deps
+	fi
 	remove_everything
+	restore_d3cold_allowed
 	reload
 	cycle_radio
 	echo
-	report
+	if [ "$DRY_RUN" -eq 1 ]; then
+		echo "current state (nothing was changed):"
+	else
+		report
+	fi
 	exit 0
 	;;
-"" | --apply)
-	need_root "$@"
-	ensure_deps
-	echo "applying rtw89 fix..."
-	write_modprobe_conf
+apply)
+	if [ "$DRY_RUN" -eq 1 ]; then
+		echo "dry run: nothing will be written, removed or changed"
+	else
+		need_root "$@"
+		ensure_deps
+		warn_ssh "--apply"
+	fi
+	if [ "$MINIMAL" -eq 1 ]; then
+		echo "applying rtw89 fix (mode: minimal - D3cold block only)"
+	else
+		echo "applying rtw89 fix (mode: full - D3cold block, modprobe options, btusb softdep)"
+	fi
+	if [ "$MINIMAL" -eq 1 ]; then
+		if remove_managed_conf; then
+			# The running modules still carry the full-mode options.
+			reload
+		else
+			ylw "no modprobe options installed, nothing to drop"
+		fi
+	else
+		write_modprobe_conf
+		reload
+	fi
 	write_udev_rule
-	udevadm control --reload-rules 2>/dev/null || true
-	udevadm trigger --subsystem-match=pci 2>/dev/null || true
+	if [ "$DRY_RUN" -eq 1 ]; then
+		dry "run: udevadm control --reload-rules"
+		dry "run: udevadm trigger --subsystem-match=pci"
+	else
+		udevadm control --reload-rules 2>/dev/null || true
+		udevadm trigger --subsystem-match=pci 2>/dev/null || true
+	fi
 	apply_d3cold_now || true
-	reload
 
 	echo
-	report
+	if [ "$DRY_RUN" -eq 1 ]; then
+		echo "current state (nothing was changed):"
+	else
+		report
+	fi
 	echo
 	bdf=$(card_bdf || echo "")
-	d3=$(cat "/sys/bus/pci/devices/$bdf/d3cold_allowed" 2>/dev/null || echo "?")
-	ps=$(cat /sys/module/rtw89_core/parameters/disable_ps_mode 2>/dev/null || echo "?")
-	if [ "$d3" = "0" ] && [ "$ps" = "Y" ]; then
-		grn "prevention is active: D3cold blocked, low power mode off."
-		grn "If it still dies, run: sudo $0 --heal"
+	if [ -z "$bdf" ]; then
+		# Nothing installed is wrong; there is just no device to point it
+		# at yet. The udev rule matches by ID, so it applies itself when
+		# the card comes back.
+		ylw "card $PCI_ID is not on the PCI bus right now."
+		ylw "prevention files are installed and will match it when it reappears."
+		ylw "run --check then to confirm."
 	else
-		red "prevention incomplete (d3cold=$d3 ps=$ps). Reboot, then --check."
+		d3=$(cat "/sys/bus/pci/devices/$bdf/d3cold_allowed" 2>/dev/null || echo "?")
+		ps=$(cat /sys/module/rtw89_core/parameters/disable_ps_mode 2>/dev/null || echo "?")
+		if [ "$MINIMAL" -eq 1 ]; then
+			# Minimal mode promises nothing about the driver options.
+			if [ "$d3" = "0" ]; then
+				grn "prevention is active (minimal): D3cold blocked."
+				grn "If it still dies, run: sudo $0 --heal"
+			else
+				red "prevention incomplete (d3cold=$d3). Reboot, then --check."
+			fi
+		elif [ "$d3" = "0" ] && [ "$ps" = "Y" ]; then
+			grn "prevention is active: D3cold blocked, low power mode off."
+			grn "If it still dies, run: sudo $0 --heal"
+		else
+			red "prevention incomplete (d3cold=$d3 ps=$ps). Reboot, then --check."
+		fi
 	fi
-	;;
--h | --help)
-	usage
-	exit 0
-	;;
-*)
-	red "unknown option: $1"
-	usage
-	exit 1
 	;;
 esac

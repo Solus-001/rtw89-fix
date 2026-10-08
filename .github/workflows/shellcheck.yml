@@ -1,0 +1,33 @@
+name: ShellCheck
+
+# The tool is a single Bash script, so the entire test suite is: does it
+# parse, and is it free of ShellCheck findings. Both run on every push and
+# every pull request.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: bash -n and shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show tool versions
+        run: |
+          bash --version | head -1
+          shellcheck --version
+
+      - name: bash -n (syntax)
+        run: bash -n rtw89-fix
+
+      - name: shellcheck
+        run: shellcheck rtw89-fix
+
+      - name: help still works
+        run: ./rtw89-fix --help
