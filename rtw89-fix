@@ -330,23 +330,40 @@ report() {
 
 # --- prevention ----------------------------------------------------------
 
+# Announce a side effect instead of performing it. Every mutating step in this
+# script goes through here when --dry-run is on, so the dry run lists exactly
+# what a real run would do - and nothing else.
+dry() { printf '  would %s\n' "$*"; }
+
+# The modprobe conf, as it would be written. Shared by the real writer and by
+# --dry-run, which prints it instead of writing it.
+modprobe_conf_contents() {
+	echo "# $MARKER. Do not edit by hand; rerun rtw89-fix."
+	echo "# disable_ps_mode stops the firmware entering LPS, which is what"
+	echo "# leaves the xtal stuck. The aspm/clkreq lines stop the PCIe link"
+	echo "# dropping into L1ss across suspend."
+	echo "options rtw89_core disable_ps_mode=1"
+	echo "options rtw89_pci disable_aspm_l1ss=1 disable_clkreq=1"
+	# Load after btusb uploads its firmware. The combo card shares one
+	# RF frontend with Bluetooth; racing init makes coexistence flaky.
+	echo "softdep rtw89_8852be pre: btusb"
+	echo "softdep rtw89_pci pre: btusb"
+}
+
 write_modprobe_conf() {
+	if [ "$DRY_RUN" -eq 1 ]; then
+		if [ -f "$MODPROBE_CONF" ] && ! grep -q "$MARKER" "$MODPROBE_CONF"; then
+			dry "back up $MODPROBE_CONF to $MODPROBE_BAK"
+		fi
+		dry "write $MODPROBE_CONF:"
+		modprobe_conf_contents | sed 's/^/    /'
+		return 0
+	fi
 	if [ -f "$MODPROBE_CONF" ] && ! grep -q "$MARKER" "$MODPROBE_CONF"; then
 		ylw "backing up your existing $MODPROBE_CONF"
 		cp -a "$MODPROBE_CONF" "$MODPROBE_BAK"
 	fi
-	{
-		echo "# $MARKER. Do not edit by hand; rerun rtw89-fix."
-		echo "# disable_ps_mode stops the firmware entering LPS, which is what"
-		echo "# leaves the xtal stuck. The aspm/clkreq lines stop the PCIe link"
-		echo "# dropping into L1ss across suspend."
-		echo "options rtw89_core disable_ps_mode=1"
-		echo "options rtw89_pci disable_aspm_l1ss=1 disable_clkreq=1"
-		# Load after btusb uploads its firmware. The combo card shares one
-		# RF frontend with Bluetooth; racing init makes coexistence flaky.
-		echo "softdep rtw89_8852be pre: btusb"
-		echo "softdep rtw89_pci pre: btusb"
-	} >"$MODPROBE_CONF"
+	modprobe_conf_contents >"$MODPROBE_CONF"
 	grn "wrote $MODPROBE_CONF"
 }
 
@@ -367,20 +384,28 @@ write_modprobe_conf() {
 # /sys/devices/pci0000:00/0000:00:02.2/0000:01:00.0/../d3cold_allowed. udevadm
 # test never runs RUN commands, so the rule firing during a real boot is the
 # one part that still needs confirming on hardware (see README).
+# The udev rule, as it would be written.
+udev_rule_contents() {
+	echo "# $MARKER. Blocks D3cold, the PCI power state that kills this card."
+	echo "# Matched by PCI ID $PCI_ID rather than by bus address: bus numbers"
+	echo "# move between boots, and the card can be absent when this is written."
+	echo "# %p is the card's sysfs path when the event fires, so the RUN line"
+	echo "# also reaches its immediate parent without that address being pinned."
+	echo "SUBSYSTEM==\"pci\", ATTR{vendor}==\"0x${PCI_ID%%:*}\", ATTR{device}==\"0x${PCI_ID##*:}\", ATTR{d3cold_allowed}=\"0\", RUN+=\"/bin/sh -c 'echo 0 > /sys%p/../d3cold_allowed'\""
+}
+
 write_udev_rule() {
 	local card parent
 	card=$(card_bdf) || card=""
 
-	{
-		echo "# $MARKER. Blocks D3cold, the PCI power state that kills this card."
-		echo "# Matched by PCI ID $PCI_ID rather than by bus address: bus numbers"
-		echo "# move between boots, and the card can be absent when this is written."
-		echo "# %p is the card's sysfs path when the event fires, so the RUN line"
-		echo "# also reaches its immediate parent without that address being pinned."
-		echo "SUBSYSTEM==\"pci\", ATTR{vendor}==\"0x${PCI_ID%%:*}\", ATTR{device}==\"0x${PCI_ID##*:}\", ATTR{d3cold_allowed}=\"0\", RUN+=\"/bin/sh -c 'echo 0 > /sys%p/../d3cold_allowed'\""
-	} >"$UDEV_RULE"
+	if [ "$DRY_RUN" -eq 1 ]; then
+		dry "write $UDEV_RULE:"
+		udev_rule_contents | sed 's/^/    /'
+	else
+		udev_rule_contents >"$UDEV_RULE"
+		grn "wrote $UDEV_RULE"
+	fi
 
-	grn "wrote $UDEV_RULE"
 	if [ -z "$card" ]; then
 		ylw "card $PCI_ID is not on the PCI bus right now; the rule will match"
 		ylw "the card and its parent as soon as it reappears"
@@ -405,6 +430,10 @@ apply_d3cold_now() {
 		[ -n "$d" ] || continue
 		case "$seen" in *" $d "*) continue ;; esac
 		seen="$seen$d "
+		if [ "$DRY_RUN" -eq 1 ]; then
+			dry "set d3cold_allowed=0 on $d"
+			continue
+		fi
 		[ -w "/sys/bus/pci/devices/$d/d3cold_allowed" ] || continue
 		echo 0 >"/sys/bus/pci/devices/$d/d3cold_allowed"
 		grn "d3cold_allowed=0 on $d"
@@ -430,6 +459,10 @@ unload_modules() {
 }
 
 reload() {
+	if [ "$DRY_RUN" -eq 1 ]; then
+		dry "reload the rtw89 driver modules (unload ${UNLOAD_ORDER[*]}, load ${LOAD_ORDER[*]})"
+		return 0
+	fi
 	if ! unload_modules; then
 		ylw "some modules stayed loaded (something holds them);"
 		ylw "the new parameters may not have applied. Reboot to be sure."
@@ -442,6 +475,10 @@ reload() {
 # --- recovery ------------------------------------------------------------
 
 cycle_radio() {
+	if [ "$DRY_RUN" -eq 1 ]; then
+		dry "cycle the Wi-Fi radio (NetworkManager or rfkill)"
+		return 0
+	fi
 	if have_nm; then
 		nmcli radio wifi off >/dev/null 2>&1 || true
 		sleep 2
@@ -562,19 +599,20 @@ heal() {
 }
 
 remove_everything() {
-	if [ -f "$MODPROBE_CONF" ] && grep -q "$MARKER" "$MODPROBE_CONF"; then
-		rm -f "$MODPROBE_CONF"
-		ylw "removed $MODPROBE_CONF"
-	fi
-	if [ -f "$MODPROBE_BAK" ]; then
-		mv "$MODPROBE_BAK" "$MODPROBE_CONF"
-		grn "restored your original $MODPROBE_CONF"
-	fi
+	remove_managed_conf || true
 	if [ -f "$UDEV_RULE" ]; then
-		rm -f "$UDEV_RULE"
-		ylw "removed $UDEV_RULE"
+		if [ "$DRY_RUN" -eq 1 ]; then
+			dry "remove $UDEV_RULE"
+		else
+			rm -f "$UDEV_RULE"
+			ylw "removed $UDEV_RULE"
+		fi
 	fi
-	udevadm control --reload-rules 2>/dev/null || true
+	if [ "$DRY_RUN" -eq 1 ]; then
+		dry "run: udevadm control --reload-rules"
+	else
+		udevadm control --reload-rules 2>/dev/null || true
+	fi
 }
 
 # --- entry ---------------------------------------------------------------
@@ -591,6 +629,9 @@ Usage: rtw89-fix [option]
   --revert          remove every file this script created (needs root)
   --minimal         apply only the D3cold block: no modprobe options and no
                     btusb softdep (implies --apply)
+  --dry-run         with --apply or --revert: print every file that would be
+                    written or removed and every sysfs value that would
+                    change, then change nothing (no root needed)
   -h, --help        show this help
 
 Modes:
@@ -618,9 +659,14 @@ installed_mode() {
 
 # Remove the modprobe conf this script wrote, restoring the backup of the
 # user's own file if we took one. Shared by --minimal, which must not leave
-# full-mode options behind.
+# full-mode options behind, and by --revert.
 remove_managed_conf() {
 	if [ -f "$MODPROBE_CONF" ] && grep -q "$MARKER" "$MODPROBE_CONF"; then
+		if [ "$DRY_RUN" -eq 1 ]; then
+			dry "remove $MODPROBE_CONF"
+			[ -f "$MODPROBE_BAK" ] && dry "restore $MODPROBE_BAK to $MODPROBE_CONF"
+			return 0
+		fi
 		rm -f "$MODPROBE_CONF"
 		ylw "removed $MODPROBE_CONF"
 		if [ -f "$MODPROBE_BAK" ]; then
@@ -634,6 +680,7 @@ remove_managed_conf() {
 
 ACTION=""
 MINIMAL=0
+DRY_RUN=0
 
 set_action() {
 	if [ "$MINIMAL" -eq 1 ] && [ "$1" != "apply" ]; then
@@ -659,6 +706,7 @@ for arg in "$@"; do
 		esac
 		MINIMAL=1
 		;;
+	--dry-run) DRY_RUN=1 ;;
 	-h | --help)
 		usage
 		exit 0
@@ -672,6 +720,13 @@ for arg in "$@"; do
 done
 [ -z "$ACTION" ] && ACTION=apply
 
+if [ "$DRY_RUN" -eq 1 ]; then
+	case "$ACTION" in
+	apply | revert) ;;
+	*) die "--dry-run is only supported with --apply and --revert (not --$ACTION)" ;;
+	esac
+fi
+
 case "$ACTION" in
 check)
 	echo "rtl8852be state:"
@@ -684,18 +739,30 @@ heal)
 	heal
 	;;
 revert)
-	need_root "$@"
-	ensure_deps
+	if [ "$DRY_RUN" -eq 1 ]; then
+		echo "dry run: nothing will be written, removed or changed"
+	else
+		need_root "$@"
+		ensure_deps
+	fi
 	remove_everything
 	reload
 	cycle_radio
 	echo
-	report
+	if [ "$DRY_RUN" -eq 1 ]; then
+		echo "current state (nothing was changed):"
+	else
+		report
+	fi
 	exit 0
 	;;
 apply)
-	need_root "$@"
-	ensure_deps
+	if [ "$DRY_RUN" -eq 1 ]; then
+		echo "dry run: nothing will be written, removed or changed"
+	else
+		need_root "$@"
+		ensure_deps
+	fi
 	if [ "$MINIMAL" -eq 1 ]; then
 		echo "applying rtw89 fix (mode: minimal - D3cold block only)"
 	else
@@ -713,12 +780,21 @@ apply)
 		reload
 	fi
 	write_udev_rule
-	udevadm control --reload-rules 2>/dev/null || true
-	udevadm trigger --subsystem-match=pci 2>/dev/null || true
+	if [ "$DRY_RUN" -eq 1 ]; then
+		dry "run: udevadm control --reload-rules"
+		dry "run: udevadm trigger --subsystem-match=pci"
+	else
+		udevadm control --reload-rules 2>/dev/null || true
+		udevadm trigger --subsystem-match=pci 2>/dev/null || true
+	fi
 	apply_d3cold_now || true
 
 	echo
-	report
+	if [ "$DRY_RUN" -eq 1 ]; then
+		echo "current state (nothing was changed):"
+	else
+		report
+	fi
 	echo
 	bdf=$(card_bdf || echo "")
 	if [ -z "$bdf" ]; then
