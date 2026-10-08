@@ -160,13 +160,12 @@ an issue using the [bug report template](.github/ISSUE_TEMPLATE/bug-report.md)
 and say what you have — even "it works" is useful, and the template makes the
 information to collect obvious.
 
-One caveat about the udev rule: it was checked with `udevadm verify` and
-`udevadm test` on the author's card (matches, the `d3cold_allowed` write and
-the parent `RUN` command with its path expanded correctly), but `udevadm test`
-never *runs* `RUN` commands — so the rule firing during an actual boot is the
-one part still waiting on a real confirmation. `--check` shows the live value
-of `d3cold_allowed` on the card and the parent after a reboot; if both are 0,
-the rule fired.
+The udev rule was confirmed firing at boot on the author's machine: after a
+reboot with the new rule installed, `--check` reported `d3cold card: 0` and
+`d3cold parent: 0`, with the rule file predating the boot. Since
+`d3cold_allowed` resets to `1` at every enumeration, those values can only have
+come from udev — so the `RUN` line that reaches the parent does work. Run
+`--check` after a reboot on your own machine to confirm the same there.
 
 ## Supported distros
 

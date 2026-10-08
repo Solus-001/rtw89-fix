@@ -484,9 +484,12 @@ write_modprobe_conf() {
 # `udevadm test -v /sys/bus/pci/devices/0000:01:00.0` shows SUBSYSTEM,
 # ATTR{vendor} and ATTR{device} all PASS, ATTR{d3cold_allowed}="0" read as a
 # sysfs write, and the RUN command queued with the parent path expanded to
-# /sys/devices/pci0000:00/0000:00:02.2/0000:01:00.0/../d3cold_allowed. udevadm
-# test never runs RUN commands, so the rule firing during a real boot is the
-# one part that still needs confirming on hardware (see README).
+# /sys/devices/pci0000:00/0000:00:02.2/0000:01:00.0/../d3cold_allowed.
+#
+# udevadm test never runs RUN commands, so that only proves parsing. The rule
+# firing for real was confirmed on a reboot on the author's machine, where the
+# rule file predated the boot and both d3cold_allowed values still read 0 -
+# an attribute that resets to 1 at every enumeration, so udev wrote both.
 # The udev rule, as it would be written.
 udev_rule_contents() {
 	echo "# $MARKER. Blocks D3cold, the PCI power state that kills this card."

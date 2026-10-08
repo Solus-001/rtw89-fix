@@ -74,15 +74,36 @@ a namespaced fake-root sandbox rather than on the real system.
 
 ### Known limitations
 
-- The udev rule's `RUN` command has never been observed firing during a real
-  boot. `udevadm verify` passes and `udevadm test` shows the rule matching and
-  the command queued with its path expanded, but `udevadm test` does not run
-  `RUN`. After a reboot, `--check` showing `d3cold_allowed 0` on both the card
-  and the parent is the confirmation.
+- `--heal` has never been run against a genuinely wedged card. The recovery
+  paths (radio cycle, PCI remove/rescan, the vanished-card path) were
+  exercised in a fake-root sandbox; forcing the PCI power cycle on a healthy
+  card to see what happens is not a test worth doing.
+- The udev rule is confirmed working at boot on the author's machine — see
+  below — but only on one, and only with this card's firmware.
 - Tested on one machine only. See the "Tested on" table in the README.
 - `disable_ps_mode`, the L1ss/clkreq pair and the btusb softdep are extra
   measures, applied as a set and never individually verified. D3cold blocking
   is the core fix; `--minimal` applies only that.
+
+### Verified on hardware
+
+The udev rule was confirmed firing during a real boot on the author's machine
+(HP 15-fc0000ni, kernel 7.2.9-1-cachyos):
+
+- 19:20:58 — new ID-matched rule written to `/etc/udev/rules.d`
+- 19:23:35 — machine booted
+- 19:23:52 — `pci 0000:01:00.0: [10ec:b85b] ... PME# supported from D0 D3hot D3cold`
+  (the card enumerating fresh, with D3cold available)
+- after boot — `--check` reports `d3cold card: 0` and `d3cold parent: 0`
+
+`d3cold_allowed` is a live sysfs attribute that resets to `1` at every
+enumeration, and the rule file predates the boot, so both values can only have
+been written by udev during this boot. That exercises the whole ID-matched path
+including `RUN+="/bin/sh -c 'echo 0 > /sys%p/../d3cold_allowed'"`, with no
+address pinned.
+
+`--apply` was also run for real on that machine; it rewrote the old
+BDF-based rule in place, leaving no duplicate or stale lines.
 
 ## [0.1.0]
 
