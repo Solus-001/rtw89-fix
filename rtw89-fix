@@ -315,6 +315,17 @@ report() {
 	fi
 	echo "  modprobe conf:   $([ -f "$MODPROBE_CONF" ] && echo present || echo absent)"
 	echo "  udev rule:       $([ -f "$UDEV_RULE" ] && echo present || echo absent)"
+	case "$(installed_mode)" in
+	full)
+		echo "  mode:            full (D3cold block + modprobe options + btusb softdep)"
+		;;
+	minimal)
+		echo "  mode:            minimal (D3cold block only)"
+		;;
+	*)
+		echo "  mode:            none (no rtw89-fix files installed)"
+		;;
+	esac
 }
 
 # --- prevention ----------------------------------------------------------
@@ -578,24 +589,101 @@ Usage: rtw89-fix [option]
   --heal            recover a wedged card right now (needs root)
   --check           report state only, no changes, no root
   --revert          remove every file this script created (needs root)
+  --minimal         apply only the D3cold block: no modprobe options and no
+                    btusb softdep (implies --apply)
   -h, --help        show this help
+
+Modes:
+  full     D3cold block + modprobe options (disable_ps_mode, L1ss/clkreq) +
+           btusb softdep. This is the default.
+  minimal  D3cold block only. Use this if the modprobe options cause
+           trouble on your machine.
 
 Supported: Arch-based, Fedora-based, and Ubuntu/Debian-based distros.
 EOF
 }
 
-case "${1:-}" in
---check)
+# Which mode the installed files correspond to. The udev rule is the same in
+# both modes, so only the modprobe conf tells them apart: a conf carrying our
+# marker means full mode was applied, a rule without one means minimal.
+installed_mode() {
+	if [ -f "$MODPROBE_CONF" ] && grep -q "$MARKER" "$MODPROBE_CONF"; then
+		echo full
+	elif [ -f "$UDEV_RULE" ] && grep -q "$MARKER" "$UDEV_RULE"; then
+		echo minimal
+	else
+		echo none
+	fi
+}
+
+# Remove the modprobe conf this script wrote, restoring the backup of the
+# user's own file if we took one. Shared by --minimal, which must not leave
+# full-mode options behind.
+remove_managed_conf() {
+	if [ -f "$MODPROBE_CONF" ] && grep -q "$MARKER" "$MODPROBE_CONF"; then
+		rm -f "$MODPROBE_CONF"
+		ylw "removed $MODPROBE_CONF"
+		if [ -f "$MODPROBE_BAK" ]; then
+			mv "$MODPROBE_BAK" "$MODPROBE_CONF"
+			grn "restored your original $MODPROBE_CONF"
+		fi
+		return 0
+	fi
+	return 1
+}
+
+ACTION=""
+MINIMAL=0
+
+set_action() {
+	if [ "$MINIMAL" -eq 1 ] && [ "$1" != "apply" ]; then
+		die "--minimal only applies to --apply (not --$1)"
+	fi
+	case "$ACTION" in
+	"") ACTION="$1" ;;
+	"$1") ;; # the same action twice is harmless
+	*) die "conflicting options: --$ACTION and --$1" ;;
+	esac
+}
+
+for arg in "$@"; do
+	case "$arg" in
+	--apply) set_action apply ;;
+	--heal) set_action heal ;;
+	--check) set_action check ;;
+	--revert) set_action revert ;;
+	--minimal)
+		case "$ACTION" in
+		"" | apply) ;;
+		*) die "--minimal only applies to --apply (not --$ACTION)" ;;
+		esac
+		MINIMAL=1
+		;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	*)
+		red "unknown option: $arg"
+		usage
+		exit 1
+		;;
+	esac
+done
+[ -z "$ACTION" ] && ACTION=apply
+
+case "$ACTION" in
+check)
 	echo "rtl8852be state:"
 	report
 	exit 0
 	;;
---heal)
+heal)
 	need_root "$@"
 	ensure_deps
 	heal
 	;;
---revert)
+revert)
 	need_root "$@"
 	ensure_deps
 	remove_everything
@@ -605,16 +693,29 @@ case "${1:-}" in
 	report
 	exit 0
 	;;
-"" | --apply)
+apply)
 	need_root "$@"
 	ensure_deps
-	echo "applying rtw89 fix..."
-	write_modprobe_conf
+	if [ "$MINIMAL" -eq 1 ]; then
+		echo "applying rtw89 fix (mode: minimal - D3cold block only)"
+	else
+		echo "applying rtw89 fix (mode: full - D3cold block, modprobe options, btusb softdep)"
+	fi
+	if [ "$MINIMAL" -eq 1 ]; then
+		if remove_managed_conf; then
+			# The running modules still carry the full-mode options.
+			reload
+		else
+			ylw "no modprobe options installed, nothing to drop"
+		fi
+	else
+		write_modprobe_conf
+		reload
+	fi
 	write_udev_rule
 	udevadm control --reload-rules 2>/dev/null || true
 	udevadm trigger --subsystem-match=pci 2>/dev/null || true
 	apply_d3cold_now || true
-	reload
 
 	echo
 	report
@@ -630,21 +731,20 @@ case "${1:-}" in
 	else
 		d3=$(cat "/sys/bus/pci/devices/$bdf/d3cold_allowed" 2>/dev/null || echo "?")
 		ps=$(cat /sys/module/rtw89_core/parameters/disable_ps_mode 2>/dev/null || echo "?")
-		if [ "$d3" = "0" ] && [ "$ps" = "Y" ]; then
+		if [ "$MINIMAL" -eq 1 ]; then
+			# Minimal mode promises nothing about the driver options.
+			if [ "$d3" = "0" ]; then
+				grn "prevention is active (minimal): D3cold blocked."
+				grn "If it still dies, run: sudo $0 --heal"
+			else
+				red "prevention incomplete (d3cold=$d3). Reboot, then --check."
+			fi
+		elif [ "$d3" = "0" ] && [ "$ps" = "Y" ]; then
 			grn "prevention is active: D3cold blocked, low power mode off."
 			grn "If it still dies, run: sudo $0 --heal"
 		else
 			red "prevention incomplete (d3cold=$d3 ps=$ps). Reboot, then --check."
 		fi
 	fi
-	;;
--h | --help)
-	usage
-	exit 0
-	;;
-*)
-	red "unknown option: $1"
-	usage
-	exit 1
 	;;
 esac
