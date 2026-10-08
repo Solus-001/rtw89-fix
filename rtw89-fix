@@ -327,42 +327,45 @@ write_modprobe_conf() {
 
 # d3cold_allowed lives on the PCI device, so a modprobe option cannot reach
 # it. udev is the only hook that runs early enough, at every boot.
+#
+# The rule matches the card by vendor/device ID rather than by
+# KERNEL=="<bdf>": bus addresses move when firmware, a dock or a BIOS update
+# re-enumerates the bus, and a hardcoded line then blocks D3cold on whatever
+# landed at that address instead of on this card. The immediate parent (a
+# root port, or a bridge on laptops that hang the WLAN slot off one) is
+# reached through %p at event time, so it is never pinned either.
+#
+# Checked on the author's machine, systemd 262: `udevadm verify` passes, and
+# `udevadm test -v /sys/bus/pci/devices/0000:01:00.0` shows SUBSYSTEM,
+# ATTR{vendor} and ATTR{device} all PASS, ATTR{d3cold_allowed}="0" read as a
+# sysfs write, and the RUN command queued with the parent path expanded to
+# /sys/devices/pci0000:00/0000:00:02.2/0000:01:00.0/../d3cold_allowed. udevadm
+# test never runs RUN commands, so the rule firing during a real boot is the
+# one part that still needs confirming on hardware (see README).
 write_udev_rule() {
-	local card port
-
-	if ! card=$(card_bdf); then
-		# The card is wedged hard enough to have dropped off the bus
-		# entirely. Dying here would leave --apply half done (modprobe conf
-		# written, no udev rule), so write the rule by vendor/device ID
-		# instead: it needs no addresses, and %p is resolved when the event
-		# fires, so the parent port is covered too once the card returns.
-		ylw "card $PCI_ID is not on the PCI bus right now"
-		{
-			echo "# $MARKER. Blocks D3cold, the PCI power state that kills this card."
-			echo "# Written while $PCI_ID was absent from the bus, so it matches"
-			echo "# the vendor/device ID rather than a bus address."
-			echo "SUBSYSTEM==\"pci\", ATTR{vendor}==\"0x${PCI_ID%%:*}\", ATTR{device}==\"0x${PCI_ID##*:}\", ATTR{d3cold_allowed}=\"0\", RUN+=\"/bin/sh -c 'echo 0 > /sys%p/../d3cold_allowed'\""
-		} >"$UDEV_RULE"
-		grn "wrote $UDEV_RULE"
-		echo "     matched by PCI ID $PCI_ID; the parent port is covered by the"
-		echo "     RUN line as soon as the card reappears"
-		return 0
-	fi
-
-	port=$(root_port_bdf) || port=""
+	local card parent
+	card=$(card_bdf) || card=""
 
 	{
 		echo "# $MARKER. Blocks D3cold, the PCI power state that kills this card."
-		echo "SUBSYSTEM==\"pci\", KERNEL==\"$card\", ATTR{d3cold_allowed}=\"0\""
-		if [ -n "$port" ] && [ "$port" != "$card" ]; then
-			echo "SUBSYSTEM==\"pci\", KERNEL==\"$port\", ATTR{d3cold_allowed}=\"0\""
-		fi
+		echo "# Matched by PCI ID $PCI_ID rather than by bus address: bus numbers"
+		echo "# move between boots, and the card can be absent when this is written."
+		echo "# %p is the card's sysfs path when the event fires, so the RUN line"
+		echo "# also reaches its immediate parent without that address being pinned."
+		echo "SUBSYSTEM==\"pci\", ATTR{vendor}==\"0x${PCI_ID%%:*}\", ATTR{device}==\"0x${PCI_ID##*:}\", ATTR{d3cold_allowed}=\"0\", RUN+=\"/bin/sh -c 'echo 0 > /sys%p/../d3cold_allowed'\""
 	} >"$UDEV_RULE"
 
 	grn "wrote $UDEV_RULE"
-	echo "     card:  $card d3cold blocked"
-	[ -n "$port" ] && [ "$port" != "$card" ] &&
-		echo "     port:  $port d3cold blocked"
+	if [ -z "$card" ]; then
+		ylw "card $PCI_ID is not on the PCI bus right now; the rule will match"
+		ylw "the card and its parent as soon as it reappears"
+		return 0
+	fi
+	parent=$(root_port_bdf) || parent=""
+	echo "     card:   $card d3cold blocked, matched by PCI ID $PCI_ID"
+	if [ -n "$parent" ] && [ "$parent" != "$card" ]; then
+		echo "     parent: $parent d3cold blocked via the card's sysfs path"
+	fi
 	return 0
 }
 
