@@ -32,7 +32,8 @@ lspci -nn | grep -i realtek
 ```
 
 <!-- Expected: a line like
-"Network controller [0280]: Realtek Semiconductor Corp. RTL8852BE [10ec:b85b]".
+"01:00.0 Network controller [0280]: Realtek Semiconductor Co., Ltd. RTL8852BE
+ PCIe 802.11ax Wireless Network Controller [1T1R] [10ec:b85b]".
 If yours says something else (different device ID, or no match), that is
 the answer: this tool only handles 10ec:b85b. -->
 
