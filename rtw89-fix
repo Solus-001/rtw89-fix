@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # rtw89-fix - repair the RTL8852BE (rtw89) WiFi card on Linux.
 #
-# Works on Arch-based, Fedora-based, and Ubuntu/Debian-based distros. The
-# distro family is detected from /etc/os-release and pacman, dnf, or apt is
-# used to fill in missing dependencies. NetworkManager and iw are optional:
-# on iwd / systemd-networkd setups the script degrades gracefully instead of
-# failing.
+# Works on Arch-based, Fedora-based, Ubuntu/Debian-based and openSUSE-based
+# distros. The distro family is detected from /etc/os-release and pacman, dnf,
+# apt or zypper is used to fill in missing dependencies. NetworkManager and iw
+# are optional: on iwd / systemd-networkd setups the script degrades
+# gracefully instead of failing.
 #
 # WHY THE OLD APPROACH FAILED
 # ---------------------------
@@ -66,7 +66,10 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # Distro detection, from the freedesktop-standard /etc/os-release that every
 # systemd distro ships. ID_LIKE catches derivatives: Manjaro says "arch",
-# Mint says "ubuntu debian", Rocky/Alma say "rhel centos fedora".
+# Mint says "ubuntu debian", Rocky/Alma say "rhel centos fedora", openSUSE
+# Leap says ID="opensuse-leap" ID_LIKE="suse opensuse", Tumbleweed says
+# ID="opensuse-tumbleweed" ID_LIKE="opensuse suse" and SLES says ID="sles"
+# ID_LIKE="suse" - matching either suse token catches the whole family.
 OS_ID=unknown
 OS_LIKE=""
 OS_PRETTY="unknown distro"
@@ -83,6 +86,7 @@ distro_family() {
 	*" arch "*) echo arch ;;
 	*" fedora "* | *" rhel "* | *" centos "*) echo fedora ;;
 	*" debian "* | *" ubuntu "*) echo debian ;;
+	*" suse "* | *" opensuse "*) echo suse ;;
 	*) echo unknown ;;
 	esac
 }
@@ -94,6 +98,7 @@ pkg_manager() {
 	arch) echo "pacman -S --needed" ;;
 	fedora) echo "dnf install" ;;
 	debian) echo "apt-get install" ;;
+	suse) echo "zypper install" ;;
 	esac
 }
 
@@ -106,7 +111,7 @@ pkg_for() {
 	iw) echo iw ;;
 	rfkill)
 		case "$family" in
-		debian) echo rfkill ;;
+		debian | suse) echo rfkill ;;
 		*) echo util-linux ;;
 		esac
 		;;
@@ -114,7 +119,6 @@ pkg_for() {
 		case "$family" in
 		arch) echo systemd ;;
 		fedora) echo systemd-udev ;;
-		debian) echo udev ;;
 		*) echo udev ;;
 		esac
 		;;
@@ -753,7 +757,8 @@ Modes:
   minimal  D3cold block only. Use this if the modprobe options cause
            trouble on your machine.
 
-Supported: Arch-based, Fedora-based, and Ubuntu/Debian-based distros.
+Supported: Arch-based, Fedora-based, Ubuntu/Debian-based and openSUSE-based
+distros.
 EOF
 }
 
