@@ -9,7 +9,7 @@ Linux — and brings it back **without a reboot** when it already has.
 |---|---|
 | Chip | **Realtek RTL8852BE** |
 | Type | Wi-Fi 6 (802.11ax) + Bluetooth combo card |
-| PCI ID | `10ec:b85b` |
+| PCI IDs | `10ec:b852` (2T2R), `10ec:b85b` (1T1R) |
 | Kernel driver | `rtw89` (`rtw89_8852be`, `rtw89_pci`, `rtw89_core`) |
 
 ## Is this your problem?
@@ -20,7 +20,7 @@ The card has to actually be an RTL8852BE:
 lspci -nn | grep -i realtek
 ```
 
-You are looking for a line containing **`[10ec:b85b]`**:
+You are looking for a line containing **`[10ec:b852]`** or **`[10ec:b85b]`**:
 
 ```
 01:00.0 Network controller [0280]: Realtek Semiconductor Co., Ltd. RTL8852BE PCIe 802.11ax Wireless Network Controller [1T1R] [10ec:b85b]
@@ -28,8 +28,8 @@ You are looking for a line containing **`[10ec:b85b]`**:
 
 Anything else means this tool is not for you. Other rtw89 cards (RTL8852AE
 `10ec:8852`, RTL8852CE `10ec:c852`, …) fail in a similar way, but the script
-matches one PCI ID and one module set; both are variables near the top of the
-file if you want to adapt it.
+matches the RTL8852BE PCI IDs and `rtw89_8852be` driver; both are variables
+near the top of the file if you want to adapt it.
 
 If the ID matches and the Wi-Fi randomly disappears, this is what it looks like
 from inside:
@@ -52,9 +52,9 @@ from inside:
 - Writes `/etc/udev/rules.d/99-rtw89-d3cold.rules`, which sets
   `d3cold_allowed=0` on the card **and** on the device it hangs off (the
   immediate parent — a PCIe root port, or a bridge on some laptops) at every
-  boot. The rule matches `ATTR{vendor}==0x10ec` + `ATTR{device}==0xb85b`, so it
-  survives the bus being renumbered, and it reaches the parent through the
-  card's own sysfs path rather than by hardcoding an address.
+  boot. The rule matches `ATTR{vendor}==0x10ec` + `ATTR{device}==0xb852` /
+  `0xb85b`, so it survives the bus being renumbered, and it reaches the parent
+  through the card's own sysfs path rather than by hardcoding an address.
 - Writes `/etc/modprobe.d/rtw89.conf` **in full mode only** (see below):
   - `disable_ps_mode=1` — keeps the firmware out of LPS low-power mode
   - `disable_aspm_l1ss=1`, `disable_clkreq=1` — keeps the PCIe link out of L1ss
@@ -211,14 +211,20 @@ Work through these in order; each one rules out a different cause:
    since the values are set at boot by the udev rule. If the parent line says
    `n/a`, the card was not on the bus when you checked.
 2. **Check you really have the card.** `lspci -nn | grep -i realtek` must show
-   `[10ec:b85b]`.
+   `[10ec:b852]` or `[10ec:b85b]`.
 3. **Was a full or minimal apply installed?** `rtw89-fix --check` prints the
    mode. If a full apply is installed, try `--apply --minimal` to remove the
    driver parameters — they are the unverified part, and if one of them is
-   fighting your firmware, minimal mode is the way to find out.
+   fighting your firmware, minimal mode is the way to find out. Conversely, if
+   full-mode options still read `N` after a reboot, your distro may bundle
+   `rtw89` into the initramfs (rebuild it with `dracut`, `mkinitcpio`, or
+   `update-initramfs`, then reboot).
 4. **Does `--heal` bring it back?** If yes, you have a recovery path and the
    card is dying, not permanently dead: `sudo rtw89-fix --heal` until you
    need a reboot. If it dies again, the prevention is not covering the case.
+   Note that on some laptops where ACPI cuts power to the M.2 slot completely
+   during suspend, a PCI remove/rescan cannot re-energize the slot — only
+   blocking D3cold beforehand prevents the loss.
 5. **Suspend or something else?** Note what precedes it. Some machines only
    die on suspend/resume, some only on long idle, some when a dock is attached.
 
